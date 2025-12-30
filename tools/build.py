@@ -9,23 +9,15 @@ import yaml
 
 # add arguments
 #
-parser = argparse.ArgumentParser(
-    description="MicroPython builder.",
-)
-parser.add_argument("-b", "--board", help="board name")
-parser.add_argument(
-    "-l", "--language", default="zh-Hans", help="firmware language (default: zh-Hans)"
-)
-parser.add_argument(
-    "-t", "--timezone", default=8, help="firmware timezone (default: 8)"
-)
+parser = argparse.ArgumentParser(description="MicroPython Board builder.")
+parser.add_argument("board", help="board name")
 parser.add_argument(
     "-w", "--address", default=0, help="firmware write address (default: 0)"
 )
-parser.add_argument("-C", "--clean", action="store_true", help="clean built")
-parser.add_argument("-E", "--erase", action="store_true", help="erase esp32 flash")
 parser.add_argument("-p", "--port", help="esp32 device port")
 parser.add_argument("-P", action="store_true", help="use default esp32 device port")
+parser.add_argument("-E", "--erase", action="store_true", help="erase esp32 device flash")
+parser.add_argument("-C", "--clean", action="store_true", help="clean built")
 args = parser.parse_args()
 
 # show help
@@ -124,22 +116,6 @@ def build(port, board):
     board_dir = f"{port_dir}/{board}"
 
     board_info = load_yaml(f"{board_dir}/boardinfo.yml")
-    board_module_path = f"{board_dir}/modules/{board.lower()}"
-
-    lang_file = ver_file = None
-    if is_exists(board_module_path):
-        lang_file = f"{board_module_path}/language.py"
-        ver_file = f"{board_module_path}/version.py"
-
-        with open(lang_file, "w") as f:
-            f.write(f'language_id = "{args.language}"\n')
-            f.write(f"timezone = {args.timezone}\n")
-
-        major, minor, revision = board_info["version"].split(".")
-        with open(ver_file, "w") as f:
-            f.write(f"major = {major}\n")
-            f.write(f"minor = {minor}\n")
-            f.write(f"revision = {revision}\n")
 
     # coping port files
     port_files = []
@@ -168,6 +144,15 @@ def build(port, board):
 
     os.chdir(f"micropython/ports/{port}")
 
+    # write version
+    board_module_path = f"boards/{board}/modules/{board.lower()}"
+    if is_exists(board_module_path):
+        major, minor, revision = board_info["version"].split(".")
+        with open(f"{board_module_path}/version.py", "w") as f:
+            f.write(f"major = {major}\n")
+            f.write(f"minor = {minor}\n")
+            f.write(f"revision = {revision}\n")
+
     # write MICROPY_BANNER_NAME_AND_VERSION and MICROPY_BANNER_MACHINE
     with open(f"boards/{board}/mpconfigboard.h", "a") as f:
         f.write(f"""
@@ -188,18 +173,12 @@ def build(port, board):
     os.system(f"make BOARD={board}")
     os.chdir("../../../")
 
-    # clean auto write files
-    if lang_file:
-        os.remove(lang_file)
-    if ver_file:
-        os.remove(ver_file)
-
     # combine resources to firmware
     resources_dir = f"{board_dir}/resources"
     firmware_path = f"micropython/ports/{port}/build-{board}/firmware.bin"
 
     # out firmware path
-    out_firmware = f"dist/{board}.{args.language}.{board_info['version']}.bin".lower()
+    out_firmware = f"dist/{board}.{board_info['version']}.bin".lower()
 
     if not is_exists("dist"):
         os.makedirs("dist")
