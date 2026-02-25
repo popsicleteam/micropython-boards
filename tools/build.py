@@ -1,11 +1,14 @@
 #!python3
 # -*- coding: UTF-8 -*-
 import argparse
+import importlib
 import os
 import re
 import shutil
+import sys
 
 import yaml
+from gen_l10n import gen_l10n
 
 # add arguments
 #
@@ -16,7 +19,9 @@ parser.add_argument(
 )
 parser.add_argument("-p", "--port", help="esp32 device port")
 parser.add_argument("-P", action="store_true", help="use default esp32 device port")
-parser.add_argument("-E", "--erase", action="store_true", help="erase esp32 device flash")
+parser.add_argument(
+    "-E", "--erase", action="store_true", help="erase esp32 device flash"
+)
 parser.add_argument("-C", "--clean", action="store_true", help="clean built")
 args = parser.parse_args()
 
@@ -28,8 +33,11 @@ if not args.board:
 
 # clean
 #
-def clean(port, board):
+def clean(board_info):
     print("\ncleaning...\n")
+
+    board = board_info["id"]
+    port = board_info["port"]
 
     os.chdir(f"micropython/ports/{port}")
     os.system(f"make clean BOARD={board}")
@@ -103,7 +111,7 @@ def read_partitions_from(files):
                 return rows
 
 
-def build(port, board):
+def build(board_info):
     # git restore
     os.chdir("micropython")
     os.system("git restore .")
@@ -112,29 +120,30 @@ def build(port, board):
 
     print("\nbuilding...\n")
 
-    port_dir = f"ports/{port}"
-    board_dir = f"{port_dir}/{board}"
+    board = board_info["id"]
+    port = board_info["port"]
+    version = board_info["version"]
 
-    board_info = load_yaml(f"{board_dir}/boardinfo.yml")
+    board_dir = f"boards/{board}"
 
-    # coping port files
-    port_files = []
-    port_files.extend(walk_dir(port_dir, True))
-
-    for file in port_files:
-        destfile = f"micropython/{file}"
-        shutil.copy(file, destfile)
+    # import board build script
+    if is_exists(f"boards/{board}/build.py"):
+        sys.path.insert(0, os.getcwd())
+        importlib.import_module(f"boards.{board}.build")
 
     # coping board files
     board_files = []
     board_files.extend(walk_dir(board_dir))
 
     for file in board_files:
-        destfile = f"micropython/{file.replace(f'/{port}/{board}/', f'/{port}/boards/{board}/')}"
+        destfile = f"micropython/{file.replace(f'boards/{board}/', f'ports/{port}/boards/{board}/')}"
         dir = os.path.dirname(destfile)
         if not is_exists(dir):
             os.makedirs(dir)
         shutil.copy(file, destfile)
+
+    # generate l10n file
+    gen_l10n(board_info)
 
     # esp32 install idf components
     cmodules_file = f"{board_dir}/cmodules.cmake"
@@ -147,7 +156,7 @@ def build(port, board):
     # write version
     board_module_path = f"boards/{board}/modules/{board.lower()}"
     if is_exists(board_module_path):
-        major, minor, revision = board_info["version"].split(".")
+        major, minor, revision = version.split(".")
         with open(f"{board_module_path}/version.py", "w") as f:
             f.write(f"major = {major}\n")
             f.write(f"minor = {minor}\n")
@@ -157,7 +166,7 @@ def build(port, board):
     with open(f"boards/{board}/mpconfigboard.h", "a") as f:
         f.write(f"""
 #define MICROPY_BANNER_NAME_AND_VERSION                                                                                \\
-    MICROPY_HW_BOARD_NAME " with " MICROPY_HW_MCU_NAME " v{board_info["version"]} base on MicroPython v" MICROPY_VERSION_STRING_BASE
+    MICROPY_HW_BOARD_NAME " with " MICROPY_HW_MCU_NAME " v{version} base on MicroPython v" MICROPY_VERSION_STRING_BASE
 
 #ifndef MICROPY_BANNER_MACHINE
 #define MICROPY_BANNER_MACHINE                                                                                         \\
@@ -239,15 +248,18 @@ def esp32_flash(firmware_path):
 
 
 if __name__ == "__main__":
-    port, board = re.split(r"[\\/]", args.board)
-    board = board.upper()
+    board = args.board.upper()
+    board_info = load_yaml(f"boards/{board}/boardinfo.yml")
 
-    if port and board and args.clean:
-        clean(port, board)
+    if board_info:
+        board_info["id"] = board
+
+    if board_info and args.clean:
+        clean(board_info)
 
     firmware_path = None
-    if port and board:
-        firmware_path = build(port, board)
+    if board_info:
+        firmware_path = build(board_info)
 
-    if port == "esp32" and (args.port or args.P):
+    if board_info["port"] == "esp32" and (args.port or args.P):
         esp32_flash(firmware_path)
