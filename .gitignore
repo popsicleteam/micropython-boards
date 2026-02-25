@@ -180,5 +180,11 @@ dist
 
 *backup
 
+# Zed Editor
+
+.zed
+
+# Fonts
+
 galmuri/
 wqy-bitmapsong/
