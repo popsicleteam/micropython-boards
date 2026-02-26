@@ -14,15 +14,10 @@ from gen_l10n import gen_l10n
 #
 parser = argparse.ArgumentParser(description="MicroPython Board builder.")
 parser.add_argument("board", help="board name")
-parser.add_argument(
-    "-w", "--address", default=0, help="firmware write address (default: 0)"
-)
-parser.add_argument("-p", "--port", help="esp32 device port")
-parser.add_argument("-P", action="store_true", help="use default esp32 device port")
-parser.add_argument(
-    "-E", "--erase", action="store_true", help="erase esp32 device flash"
-)
 parser.add_argument("-C", "--clean", action="store_true", help="clean built")
+parser.add_argument("-p", "--port", help="device port")
+parser.add_argument("-P", action="store_true", help="use default device port")
+parser.add_argument("-E", "--erase", action="store_true", help="erase device flash")
 args = parser.parse_args()
 
 # show help
@@ -122,6 +117,7 @@ def build(board_info):
 
     board = board_info["id"]
     port = board_info["port"]
+    chip = board_info["chip"]
     version = board_info["version"]
 
     board_dir = f"boards/{board}"
@@ -202,7 +198,7 @@ def build(board_info):
                 cmd_str += (
                     f"--offset {partition[3].strip()} --size {partition[4].strip()} "
                 )
-                if args.address:
+                if chip == "esp32":
                     cmd_str += "--esp32 "
                 cmd_str += f"{firmware_path} {out_firmware}"
                 os.system(cmd_str)
@@ -217,7 +213,7 @@ def build(board_info):
 
 # esp32 flash firmware
 #
-def esp32_flash(firmware_path):
+def esp32_flash(board_info, firmware_path):
     if args.erase:
         print("\ncleaning flash...\n")
         if args.P:
@@ -239,11 +235,13 @@ def esp32_flash(firmware_path):
         print(f"{firmware_list[-1]} is ready.")
 
     print("\nuploading firmware...\n")
+
+    flash_address = 0x1000 if board_info["chip"] == "esp32" else 0
     if args.P:
-        os.system(f"esptool.py --chip auto write_flash {args.address} {firmware_path}")
+        os.system(f"esptool.py --chip auto write_flash {flash_address} {firmware_path}")
     else:
         os.system(
-            f"esptool.py --chip auto --port {args.port} write_flash {args.address} {firmware_path}"
+            f"esptool.py --chip auto --port {args.port} write_flash {flash_address} {firmware_path}"
         )
 
 
@@ -262,4 +260,4 @@ if __name__ == "__main__":
         firmware_path = build(board_info)
 
     if board_info["port"] == "esp32" and (args.port or args.P):
-        esp32_flash(firmware_path)
+        esp32_flash(board_info, firmware_path)
