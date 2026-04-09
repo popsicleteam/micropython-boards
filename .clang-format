@@ -1,5 +1,7 @@
 ---
-BasedOnStyle: LLVM
-IndentWidth: 4
-ColumnLimit: 120
+BasedOnStyle: Google
+ColumnLimit: 150
+AllowShortFunctionsOnASingleLine: None
+BinPackArguments: false
+BinPackParameters: false
 ---
