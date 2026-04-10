@@ -43,6 +43,9 @@ def gen_l10n(board_info):
     locales = {}
 
     l10n_path = f"boards/{board}/l10n"
+    if not os.path.exists(l10n_path):
+        return
+
     for root, dirs, files in os.walk(l10n_path):
         for file in files:
             if file.endswith(".yml") or file.endswith(".yaml"):

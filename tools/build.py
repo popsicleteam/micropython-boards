@@ -117,7 +117,7 @@ def build(board_info):
 
     board = board_info["id"]
     port = board_info["port"]
-    chip = board_info["chip"]
+    chip = board_info["chip"] if "chip" in board_info else None
     version = board_info["version"]
 
     board_dir = f"boards/{board}"
@@ -167,9 +167,9 @@ def build(board_info):
 #ifndef MICROPY_BANNER_MACHINE
 #define MICROPY_BANNER_MACHINE                                                                                         \\
     "Provided by\\r\\n"                                                                                                  \\
-    "░█▀▄░█░░░█▀█░█▀▀░█░█░█▀▀░█▀█░█▀▄░█▀▀░░░█░░░█▀█░█▀▄\\r\\n"                                                           \\
-    "░█▀▄░█░░░█░█░█░░░█▀▄░█░░░█░█░█░█░█▀▀░░░█░░░█▀█░█▀▄\\r\\n"                                                           \\
-    "░▀▀░░▀▀▀░▀▀▀░▀▀▀░▀░▀░▀▀▀░▀▀▀░▀▀░░▀▀▀░░░▀▀▀░▀░▀░▀▀░"
+    "░█▀▄░█░░░█▀█░█▀▀░█░█░█▀▀░█▀█░█▀▄░█▀▀░░░█░░░█▀█░█▀▄░\\r\\n"                                                          \\
+    "░█▀▄░█░░░█░█░█░░░█▀▄░█░░░█░█░█░█░█▀▀░░░█░░░█▀█░█▀▄░\\r\\n"                                                          \\
+    "░▀▀░░▀▀▀░▀▀▀░▀▀▀░▀░▀░▀▀▀░▀▀▀░▀▀░░▀▀▀░░░▀▀▀░▀░▀░▀▀░░"
 #endif
 """)
 
@@ -178,10 +178,12 @@ def build(board_info):
     os.system(f"make BOARD={board}")
     os.chdir("../../../")
 
+    firmware_path = f"micropython/ports/{port}/build-{board}/firmware.bin"
+    if not is_exists(firmware_path):
+        return
+
     # combine resources to firmware
     resources_dir = f"{board_dir}/resources"
-    firmware_path = f"micropython/ports/{port}/build-{board}/firmware.bin"
-
     # out firmware path
     out_firmware = f"dist/{board}.{board_info['version']}.bin".lower()
 
@@ -236,7 +238,8 @@ def esp32_flash(board_info, firmware_path):
 
     print("\nuploading firmware...\n")
 
-    flash_address = 0x1000 if board_info["chip"] == "esp32" else 0
+    chip = board_info["chip"] if "chip" in board_info else None
+    flash_address = 0x1000 if chip == "esp32" else 0
     if args.P:
         os.system(f"esptool.py --chip auto write_flash {flash_address} {firmware_path}")
     else:
@@ -259,5 +262,5 @@ if __name__ == "__main__":
     if board_info:
         firmware_path = build(board_info)
 
-    if board_info["port"] == "esp32" and (args.port or args.P):
+    if firmware_path and board_info["port"] == "esp32" and (args.port or args.P):
         esp32_flash(board_info, firmware_path)
