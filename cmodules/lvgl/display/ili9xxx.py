@@ -1,0 +1,1 @@
+../../../lib/lv_binding_micropython/driver/generic/ili9xxx.py
