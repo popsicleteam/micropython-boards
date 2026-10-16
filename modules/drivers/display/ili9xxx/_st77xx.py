@@ -1,0 +1,1 @@
+../../../lvgl/binding/driver/generic/st77xx.py
