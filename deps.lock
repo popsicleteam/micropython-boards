@@ -1,0 +1,2 @@
+micropython     https://github.com/micropython/micropython      v1.29.0
+esp-idf         https://github.com/espressif/esp-idf.git        v5.5.4

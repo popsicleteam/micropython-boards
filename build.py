@@ -1,0 +1,418 @@
+#!/usr/bin/env python3
+"""
+编译 MicroPython 固件命令。
+
+使用：
+    ./build.py --port esp32 --board ESP32_GENERIC_S3 --modules lvgl,/home/you/extmod
+    ./build.py espressif/s3 --modules lvgl,/home/you/extmod
+    ./build.py espressif/esp32-s3-eye
+"""
+
+import argparse
+import os
+import re
+import shlex
+import shutil
+import subprocess
+from pathlib import Path
+
+import yaml
+
+REPO = Path(__file__).resolve().parent
+BUILD_DIR = REPO / "build"
+BOARDS_DIR = REPO / "boards"
+MODULES_DIR = REPO / "modules"
+MICROPY_DIR = REPO / "micropython"
+PORT_DIR = MICROPY_DIR / "ports"
+JOBS = str(os.cpu_count() or 4)
+
+BASH = "bash"
+
+
+def say(msg=""):
+    print(msg, flush=True)
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, check=True, encoding="utf-8", **kw)
+
+
+def link(dest, target):
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    os.symlink(os.path.relpath(target, dest.parent), dest)
+    say(f"linked {dest.relative_to(REPO)} -> {target}")
+
+
+def clone_at(url, ref, dest, recursive=False):
+    say(f"cloning {url} at {ref} into {dest.relative_to(REPO)}")
+    run(["git", "init", "-q", str(dest)])
+    # Git for Windows defaults core.autocrlf=true: patches checked out CRLF don't apply.
+    run(["git", "-C", str(dest), "config", "core.autocrlf", "false"])
+    run(["git", "-C", str(dest), "remote", "add", "origin", url])
+    # A tag is fetched as a tag, so the checkout can still say which one it is.
+    spec = (
+        ref
+        if re.fullmatch(r"[0-9a-f]{40}", ref)
+        else f"refs/tags/{ref}:refs/tags/{ref}"
+    )
+    run(["git", "-C", str(dest), "fetch", "-q", "--depth", "1", "origin", spec])
+    run(
+        [
+            "git",
+            "-C",
+            str(dest),
+            "-c",
+            "advice.detachedHead=false",
+            "checkout",
+            "-q",
+            ref if spec != ref else "FETCH_HEAD",
+        ]
+    )
+    if recursive:
+        run(
+            [
+                "git",
+                "-C",
+                str(dest),
+                "submodule",
+                "update",
+                "--init",
+                "--recursive",
+                "--depth",
+                "1",
+                "-q",
+            ]
+        )
+
+
+def read_mods():
+    rows = []
+    for line in (REPO / "modules.lock").read_text().splitlines():
+        line = line.partition("#")[0].strip()
+        if line:
+            rows.append(line.split())
+    return rows
+
+
+def read_dep(check_name):
+    for line in (REPO / "deps.lock").read_text().splitlines():
+        line = line.partition("#")[0].strip()
+        if line:
+            name, url, tag = line.split()
+            if name == check_name:
+                return url, tag
+    return []
+
+
+def read_config(path):
+    try:
+        if path.exists():
+            with open(path) as f:
+                return yaml.safe_load(f)
+    except Exception:
+        pass
+    return None
+
+
+def ensure_micropython(env_path):
+    if MICROPY_DIR.exists() or MICROPY_DIR.is_symlink():
+        return
+    if env_path:
+        link(MICROPY_DIR, env_path)
+    else:
+        url, tag = read_dep("micropython")
+        say(f"cloning MicroPython {tag}")
+        run(
+            [
+                "git",
+                "-c",
+                "advice.detachedHead=false",
+                "clone",
+                "-q",
+                "--depth",
+                "1",
+                "--branch",
+                tag,
+                url,
+                str(MICROPY_DIR),
+            ],
+        )
+
+
+def ensure_espidf(env_path):
+    idf_path = REPO / "tools" / "esp-idf"
+    if idf_path.exists() or idf_path.is_symlink():
+        return idf_path
+    if env_path:
+        link(idf_path, env_path)
+    else:
+        url, tag = read_dep("esp-idf")
+        say(f"cloning ESP-IDF {tag}")
+        run(
+            [
+                "git",
+                "-c",
+                "advice.detachedHead=false",
+                "clone",
+                "-q",
+                "--depth",
+                "1",
+                "--branch",
+                tag,
+                url,
+                str(idf_path),
+            ],
+        )
+    return idf_path
+
+
+def ensure_idf_deps(board_config):
+    port_path = PORT_DIR / "esp32"
+    main_deps_yml = port_path / "main" / "idf_component.yml"
+    main_deps = read_config(main_deps_yml)
+    if board_config.get("modules") is not None:
+        for mod in board_config["modules"]:
+            idf_deps = read_config(MODULES_DIR / mod / "idf_component.yml")
+            if idf_deps is not None and main_deps is not None:
+                for dep, ver in idf_deps["dependencies"].items():
+                    main_deps["dependencies"][dep] = ver
+                with open(main_deps_yml, "w", encoding="utf-8") as f:
+                    yaml.dump(main_deps, f, allow_unicode=True)
+
+
+def ensure_sdkconfig(board_config):
+    flash = "4MB" if board_config.get("flash") is None else board_config["flash"]
+    table_csv = f"boards/{board_config['board']}/partitions.csv"
+    sdkconfig = [
+        f'CONFIG_ESPTOOLPY_FLASHSIZE="{flash}"',
+        f"CONFIG_ESPTOOLPY_FLASHSIZE_{flash}=y",
+        "CONFIG_PARTITION_TABLE_CUSTOM=y",
+        f'CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="{table_csv}"',
+        f'CONFIG_PARTITION_TABLE_FILENAME="{table_csv}"',
+    ]
+    if board_config.get("sdkconfig") is not None:
+        for key, val in board_config["sdkconfig"].items():
+            if type(val) is str and val != "y":
+                val = f'"{val}"'
+            sdkconfig.append(f"CONFIG_{key}={val}")
+    with open(
+        PORT_DIR / "esp32" / "boards" / board_config["board"] / "sdkconfig.board",
+        "a",
+        encoding="utf-8",
+    ) as f:
+        f.write("\n".join(sdkconfig) + "\n")
+
+
+def writeline(f, line, search):
+    if line not in search:
+        f.write(f"{line}\n")
+
+
+def ensure_modules(board_config):
+    port = board_config["port"]
+    board_path = PORT_DIR / port / "boards" / board_config["board"]
+
+    manifest_py = board_path / "manifest.py"
+    with open(manifest_py, "a", encoding="utf-8") as f:
+        manifest = manifest_py.read_text().splitlines() if manifest_py.exists() else []
+
+        writeline(f, 'include("$(PORT_DIR)/boards")', manifest)  # 默认模块
+
+        # 模块
+        if board_config.get("modules") is not None:
+            ext_modules = {item[0].partition("/")[0]: item for item in read_mods()}
+            for mod in board_config["modules"]:
+                # 初始模块
+                if mod in ext_modules:
+                    mod_dir, url, ref = ext_modules[mod]
+                    mod_path = MODULES_DIR / Path(mod_dir)
+                    if not (mod_path.exists() or mod_path.is_symlink()):
+                        clone_at(url, ref, mod_path, True)
+
+                mod_path = Path(mod)
+                if (MODULES_DIR / mod_path).exists():  # ex. lvgl
+                    writeline(f, f'include("$(MPY_DIR)/../modules/{mod}")', manifest)
+                elif mod_path.exists():  # ex. /path/you/extmod
+                    rel_mod_path = mod_path.relative_to(REPO)
+                    writeline(f, f'include("$(MPY_DIR)/../{rel_mod_path}")', manifest)
+                else:  # ex. aioble
+                    writeline(f, f'require("{mod}")', manifest)
+
+        # 驱动模块
+        if board_config.get("drivers") is not None:
+            for drv in board_config["drivers"]:
+                if (MODULES_DIR / "drivers" / Path(drv)).exists():
+                    writeline(
+                        f, f'include("$(MPY_DIR)/../modules/drivers/{drv}")', manifest
+                    )
+
+        # 补充公共模块
+        for mod in ("base64", "hmac", "logging", "threading"):
+            writeline(f, f'require("{mod}")', manifest)
+
+        # 自定义模块
+        if (board_path / "modules").exists():
+            writeline(f, 'freeze("modules")', manifest)
+        else:
+            for mod in ("board.py", "boot.py", "main.py"):
+                if (board_path / mod).exists():
+                    writeline(f, f'module("{mod}")', manifest)
+
+
+def ensure_board(board_config, arg_board):
+    port_path = PORT_DIR / board_config["port"]
+    base_path = port_path / "boards" / board_config["base"]
+    board_path = port_path / "boards" / board_config["board"]
+    if base_path.exists():
+        shutil.copytree(
+            str(base_path),
+            str(board_path),
+            dirs_exist_ok=True,
+        )
+    shutil.copytree(
+        str(BOARDS_DIR / Path(arg_board)),
+        str(board_path),
+        ignore=shutil.ignore_patterns("mpconfig.yml", "*.romfs"),
+        dirs_exist_ok=True,
+    )
+
+
+def make_mpy_cross():
+    dest = MICROPY_DIR / "mpy-cross" / "build" / "mpy-cross"
+    if not dest.exists():
+        run(
+            ["make", "-C", str(MICROPY_DIR / "mpy-cross"), "-j", JOBS],
+            stdout=subprocess.DEVNULL,
+        )
+
+
+def make_board(prefix, board_config):
+    port = board_config["port"]
+    board = board_config["board"]
+    variant = board_config.get("variant")
+    build_path = BUILD_DIR / port / board
+
+    make = [
+        "make",
+        "-C",
+        str(PORT_DIR / port),
+        f"BUILD={str(build_path)}",
+    ]
+    if board:
+        make.append(f"BOARD={board}")
+        if variant:
+            make.append(f"BOARD_VARIANT={variant}")
+
+    subprocess.call([BASH, "-c", prefix + shlex.join(make + ["clean"])])
+    try:
+        cmds = [shlex.join(c) for c in [make + ["submodules"], make]]
+        run(
+            [BASH, "-c", prefix + " && ".join(cmds)],
+            stdout=None,
+            stderr=subprocess.PIPE,
+            text=True,
+            errors="ignore",
+        )
+    except subprocess.CalledProcessError as e:
+        print(e.stderr)
+        return
+
+    say(f"\nBuilt into {build_path.relative_to(REPO)}")
+    for name in ("firmware.bin", "firmware.uf2", "micropython"):
+        firmware_path = build_path / name
+        if firmware_path.exists():
+            say(f" {firmware_path}")
+            return firmware_path
+
+
+def main():
+    parser = argparse.ArgumentParser(description="MicroPython firmware builder.")
+    parser.add_argument("board", help="board")
+    parser.add_argument("--variant")
+    parser.add_argument("--modules", help="comma list: short names, full paths")
+    parser.add_argument("--deploy", action="store_true")
+    args = parser.parse_args()
+
+    # 检查编译环境
+    ensure_micropython(os.environ.get("MICROPY_DIR"))
+    make_mpy_cross()
+
+    # 读取开发板配置
+    mpconfig_path = BOARDS_DIR / Path(args.board) / "mpconfig.yml"
+    if not mpconfig_path.exists():
+        # micorpython 原有开发板
+        port, board = args.board.split("/")
+        port_path = PORT_DIR / port
+        board_path = port_path / "boards" / board
+        if not board_path.exists():
+            say(f"not found {port}/{board}")
+            return
+        board_config = {}
+        board_config["port"] = port
+        board_config["board"] = board
+        board_config["variant"] = args.variant
+        board_config["modules"] = args.modules
+    else:
+        # 自定义开发板
+        board_config = read_config(mpconfig_path)
+        if board_config is None:
+            say(f"read {args.board}/mpconfig.yml failed.")
+            return
+        port = board_config["port"]
+        board = re.sub(r"[^A-Za-z0-9]+", "_", args.board)
+        board_config["board"] = board
+        port_path = PORT_DIR / port
+        board_path = port_path / "boards" / board
+        if args.modules is not None:
+            modules = []
+            if board_config.get("modules") is not None:
+                modules += board_config["modules"]
+            modules += args.modules.split(",")
+            board_config["modules"] = modules
+        ensure_board(board_config, args.board)
+
+    # 检查模块
+    ensure_modules(board_config)
+
+    # 编译配置
+    prefix = ""
+    mpconfigboard_cmake = board_path / "mpconfigboard.cmake"
+    with open(mpconfigboard_cmake, "a", encoding="utf-8") as f:
+        mpconfigboard = mpconfigboard_cmake.read_text()
+
+        # 将模块加入编译配置
+        writeline(
+            f,
+            "set(MICROPY_FROZEN_MANIFEST ${MICROPY_BOARD_DIR}/manifest.py)",
+            mpconfigboard,
+        )
+
+        # 特定配置
+        if port == "esp32":
+            idf_path = ensure_espidf(os.environ.get("ESPIDF_DIR"))
+            prefix = f'. "{str(idf_path / "export.sh")}" >/dev/null && '
+            ensure_idf_deps(board_config)
+            ensure_sdkconfig(board_config)
+            if (board_path / "sdkconfig.board").exists():
+                writeline(
+                    f,
+                    "list(APPEND SDKCONFIG_DEFAULTS ${MICROPY_BOARD_DIR}/sdkconfig.board)",
+                    mpconfigboard,
+                )
+
+    # 开始编译
+    make_board(prefix, board_config)
+
+    # 清理
+    if mpconfig_path.exists():
+        shutil.rmtree(board_path, ignore_errors=True)
+    run(["git", "-C", str(MICROPY_DIR), "restore", "."])
+    run(["git", "-C", str(MICROPY_DIR), "clean", "-df"])
+
+    # 发布
+    if args.deploy:
+        run([str(REPO / "deploy.py"), args.board])
+
+
+if __name__ == "__main__":
+    main()

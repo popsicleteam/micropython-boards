@@ -1,0 +1,10 @@
+# This .gitignore file is intended to be minimal.
+/micropython
+/build/
+/release/
+/modules/lvgl/binding/
+/tools/esp-idf
+/tools/ttf/
+__pycache__/
+.cache/
+.DS_Store
