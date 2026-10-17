@@ -1,6 +1,7 @@
 import time
 
 import machine
+from _autostart import autostart
 from machine import Pin
 
 bat_en = Pin("BAT_EN", Pin.OUT, value=1)  # 开机状态下保持高电平
@@ -23,3 +24,5 @@ def pwr_handle(_):
 
 
 btn_pwr.irq(trigger=Pin.IRQ_RISING | Pin.IRQ_FALLING, handler=pwr_handle)
+
+autostart("example")
