@@ -417,7 +417,7 @@ def main():
             )
 
     # 开始编译
-    make_board(prefix, board_config)
+    firmware_path = make_board(prefix, board_config)
 
     # 清理
     if mpconfig_path.exists():
@@ -426,7 +426,7 @@ def main():
     run(["git", "-C", str(MICROPY_DIR), "clean", "-df"])
 
     # 发布
-    if args.deploy:
+    if firmware_path is not None and args.deploy:
         run([str(REPO / "deploy.py"), args.board])
 
 
