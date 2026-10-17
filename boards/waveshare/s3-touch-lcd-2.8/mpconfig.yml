@@ -1,0 +1,16 @@
+port: esp32
+base: ESP32_GENERIC_S3
+variant: SPIRAM_OCT
+flash: 16MB
+modules:
+  - aioble
+  - aiohttp
+  - blerepl
+  - lvgl
+  - ntptime
+  - utils
+drivers:
+  - display/st77xx
+  - touch/cst3xx
+  - posture/qmi8658
+  - device/pcf85063
