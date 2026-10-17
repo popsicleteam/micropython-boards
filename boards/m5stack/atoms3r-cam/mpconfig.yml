@@ -1,0 +1,15 @@
+port: esp32
+base: ESP32_GENERIC_S3
+variant: SPIRAM_OCT
+flash: 8MB
+modules:
+  - aioble
+  - aiohttp
+  - blerepl
+  - camera
+  - utils
+sdkconfig:
+  SCCB_HARDWARE_I2C_PORT1: 0
+  SCCB_CLK_FREQ: 400000
+  CAMERA_CORE0: 1
+  CAMERA_DMA_BUFFER_SIZE_MAX: 32768
