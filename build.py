@@ -400,6 +400,22 @@ def main():
                     mpconfigboard,
                 )
 
+    # 修改默认 MICROPY_BANNER 显示文本
+    mpconfigboard_h = board_path / "mpconfigboard.h"
+    with open(mpconfigboard_h, "a", encoding="utf-8") as f:
+        mpconfigboard = mpconfigboard_h.read_text()
+        writeline(
+            f,
+            '#define MICROPY_BANNER_NAME_AND_VERSION "MicroPython v" MICROPY_VERSION_STRING_BASE " on " MICROPY_BUILD_DATE',
+            mpconfigboard,
+        )
+        if board_config.get("banner") is not None:
+            writeline(
+                f,
+                f'#define MICROPY_BANNER_MACHINE "{board_config["banner"]}"',
+                mpconfigboard,
+            )
+
     # 开始编译
     make_board(prefix, board_config)
 
