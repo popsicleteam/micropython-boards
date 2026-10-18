@@ -14,6 +14,8 @@ import re
 import shlex
 import shutil
 import subprocess
+import zipfile
+from datetime import datetime
 from pathlib import Path
 
 import yaml
@@ -22,6 +24,7 @@ REPO = Path(__file__).resolve().parent
 BUILD_DIR = REPO / "build"
 BOARDS_DIR = REPO / "boards"
 MODULES_DIR = REPO / "modules"
+RELEASE_DIR = REPO / "release"
 MICROPY_DIR = REPO / "micropython"
 PORT_DIR = MICROPY_DIR / "ports"
 JOBS = str(os.cpu_count() or 4)
@@ -105,13 +108,9 @@ def read_dep(check_name):
 
 
 def read_config(path):
-    try:
-        if path.exists():
-            with open(path) as f:
-                return yaml.safe_load(f)
-    except Exception:
-        pass
-    return None
+    if path.exists():
+        with open(path) as f:
+            return yaml.safe_load(f)
 
 
 def ensure_micropython(env_path):
@@ -181,26 +180,35 @@ def ensure_idf_deps(board_config):
 
 
 def ensure_sdkconfig(board_config):
-    flash = "4MB" if board_config.get("flash") is None else board_config["flash"]
-    table_csv = f"boards/{board_config['board']}/partitions.csv"
-    sdkconfig = [
-        f'CONFIG_ESPTOOLPY_FLASHSIZE="{flash}"',
-        f"CONFIG_ESPTOOLPY_FLASHSIZE_{flash}=y",
-        "CONFIG_PARTITION_TABLE_CUSTOM=y",
-        f'CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="{table_csv}"',
-        f'CONFIG_PARTITION_TABLE_FILENAME="{table_csv}"',
-    ]
+    sdkconfig = []
+    port_path = PORT_DIR / board_config["port"]
+    board_path = port_path / "boards" / board_config["board"]
+
+    table_csv = board_path / "partitions.csv"
+    if table_csv.exists():
+        flash = "4MB" if board_config.get("flash") is None else board_config["flash"]
+        rel_table_path = table_csv.relative_to(port_path)
+        sdkconfig += [
+            f'CONFIG_ESPTOOLPY_FLASHSIZE="{flash}"',
+            f"CONFIG_ESPTOOLPY_FLASHSIZE_{flash}=y",
+            "CONFIG_PARTITION_TABLE_CUSTOM=y",
+            f'CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="{rel_table_path}"',
+            f'CONFIG_PARTITION_TABLE_FILENAME="{rel_table_path}"',
+        ]
+
     if board_config.get("sdkconfig") is not None:
         for key, val in board_config["sdkconfig"].items():
             if type(val) is str and val != "y":
                 val = f'"{val}"'
             sdkconfig.append(f"CONFIG_{key}={val}")
-    with open(
-        PORT_DIR / "esp32" / "boards" / board_config["board"] / "sdkconfig.board",
-        "a",
-        encoding="utf-8",
-    ) as f:
-        f.write("\n".join(sdkconfig) + "\n")
+
+    if len(sdkconfig) > 0:
+        with open(
+            PORT_DIR / "esp32" / "boards" / board_config["board"] / "sdkconfig.board",
+            "a",
+            encoding="utf-8",
+        ) as f:
+            f.write("\n".join(sdkconfig) + "\n")
 
 
 def writeline(f, line, search):
@@ -231,7 +239,13 @@ def ensure_modules(board_config):
 
                 mod_path = Path(mod)
                 if (MODULES_DIR / mod_path).exists():  # ex. lvgl
-                    writeline(f, f'include("$(MPY_DIR)/../modules/{mod}")', manifest)
+                    writeline(
+                        f, f'include("$(MPY_DIR)/../modules/{mod_path}")', manifest
+                    )
+                elif (BOARDS_DIR / mod_path).exists():  # ex. boards/extmod
+                    writeline(
+                        f, f'include("$(MPY_DIR)/../boards/{mod_path}")', manifest
+                    )
                 elif mod_path.exists():  # ex. /path/you/extmod
                     rel_mod_path = mod_path.relative_to(REPO)
                     writeline(f, f'include("$(MPY_DIR)/../{rel_mod_path}")', manifest)
@@ -241,9 +255,12 @@ def ensure_modules(board_config):
         # 驱动模块
         if board_config.get("drivers") is not None:
             for drv in board_config["drivers"]:
-                if (MODULES_DIR / "drivers" / Path(drv)).exists():
+                drv_path = Path(drv)
+                if (MODULES_DIR / "drivers" / drv_path).exists():
                     writeline(
-                        f, f'include("$(MPY_DIR)/../modules/drivers/{drv}")', manifest
+                        f,
+                        f'include("$(MPY_DIR)/../modules/drivers/{drv_path}")',
+                        manifest,
                     )
 
         # 补充公共模块
@@ -296,7 +313,7 @@ def make_board(prefix, board_config):
         "make",
         "-C",
         str(PORT_DIR / port),
-        f"BUILD={str(build_path)}",
+        f"BUILD={build_path}",
     ]
     if board:
         make.append(f"BOARD={board}")
@@ -331,6 +348,7 @@ def main():
     parser.add_argument("--variant")
     parser.add_argument("--modules", help="comma list: short names, full paths")
     parser.add_argument("--deploy", action="store_true")
+    parser.add_argument("--release", action="store_true")
     args = parser.parse_args()
 
     # 检查编译环境
@@ -390,7 +408,7 @@ def main():
         # 特定配置
         if port == "esp32":
             idf_path = ensure_espidf(os.environ.get("ESPIDF_DIR"))
-            prefix = f'. "{str(idf_path / "export.sh")}" >/dev/null && '
+            prefix = f'. "{(idf_path / "export.sh")}" >/dev/null && '
             ensure_idf_deps(board_config)
             ensure_sdkconfig(board_config)
             if (board_path / "sdkconfig.board").exists():
@@ -425,9 +443,24 @@ def main():
     run(["git", "-C", str(MICROPY_DIR), "restore", "."])
     run(["git", "-C", str(MICROPY_DIR), "clean", "-df"])
 
-    # 发布
-    if firmware_path is not None and args.deploy:
+    if firmware_path is None:
+        return
+
+    # 部署
+    if args.deploy:
         run([str(REPO / "deploy.py"), args.board])
+
+    # 发布
+    if args.release:
+        release_path = RELEASE_DIR / port
+        release_path.mkdir(parents=True, exist_ok=True)
+        firmware_zip = (
+            release_path / f"{board}_{datetime.now().strftime('%Y-%m-%d')}.zip"
+        )
+        with zipfile.ZipFile(firmware_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.write(firmware_path, arcname=os.path.basename(firmware_path))
+        say(f"\nReleased into {release_path.relative_to(REPO)}")
+        say(f" {firmware_zip}")
 
 
 if __name__ == "__main__":

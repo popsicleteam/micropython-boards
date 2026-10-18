@@ -1,0 +1,9 @@
+port: esp32
+base: ESP32_GENERIC_S3
+flash: 8MB
+modules:
+  - aioble
+  - aiohttp
+  - blerepl
+  - ntptime
+  - utils

@@ -1,0 +1,13 @@
+port: esp32
+base: ESP32_GENERIC_S3
+variant: SPIRAM_OCT
+flash: 8MB
+modules:
+  - aioble
+  - aiohttp
+  - blerepl
+  - lvgl
+  - ntptime
+  - utils
+drivers:
+  - display/ili9xxx
