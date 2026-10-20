@@ -271,7 +271,7 @@ def ensure_modules(board_config):
         if (board_path / "modules").exists():
             writeline(f, 'freeze("modules")', manifest)
         else:
-            for mod in ("board.py", "boot.py", "main.py"):
+            for mod in ("board_config.py", "boot.py", "main.py"):
                 if (board_path / mod).exists():
                     writeline(f, f'module("{mod}")', manifest)
 
