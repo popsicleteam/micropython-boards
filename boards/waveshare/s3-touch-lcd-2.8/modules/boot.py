@@ -1,3 +1,3 @@
-from _autostart import autostart
+from autostart import autostart
 
-autostart("example")
+autostart()

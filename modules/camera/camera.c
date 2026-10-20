@@ -66,7 +66,7 @@ static bool camera_init_helper(camera_obj_t* camera, size_t n_pos_args, const mp
       {MP_QSTR_sda, MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = CAM_PIN_SIOD}},
       {MP_QSTR_scl, MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = CAM_PIN_SIOC}},
       {MP_QSTR_xclk_freq, MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = XCLK_FREQ_20MHz}},
-      {MP_QSTR_fb_size, MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 2}},
+      {MP_QSTR_fb_size, MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 1}},
       {MP_QSTR_fb_location, MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = CAMERA_FB_IN_PSRAM}},
   };
 
@@ -214,7 +214,6 @@ static mp_obj_t camera_jpeg(size_t n_pos_args, const mp_obj_t* pos_args, mp_map_
     if (!converted || jpg_buf == NULL) {
       ESP_LOGE(TAG, "JPEG conversion failed");
       esp_camera_fb_return(fb);
-      mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("JPEG conversion failed"));
       return mp_const_false;
     }
     image = mp_obj_new_bytes(jpg_buf, jpg_len);
