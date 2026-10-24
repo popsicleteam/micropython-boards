@@ -3,6 +3,8 @@
 /build/
 /release/
 /modules/lvgl/binding/
+/modules/vision/esp_vision/
+/modules/vision/ulab/
 /tools/esp-idf
 /tools/ttf/
 __pycache__/
