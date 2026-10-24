@@ -11,13 +11,10 @@ _devices = {}
 
 def __getattr__(name):
     attr = getattr(board_config, name, None)
-    if attr is None:
+    if attr is None or str(type(attr)) == "<class 'module'>":
         if _devices.get(name, None):
             return _devices[name]
         return None
-
-    if not callable(attr):
-        return attr
 
     if name.endswith("_init"):
         key = name[: -len("_init")]
@@ -44,3 +41,5 @@ def __getattr__(name):
             return False
 
         return deinit
+
+    return attr

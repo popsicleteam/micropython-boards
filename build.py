@@ -9,6 +9,7 @@
 """
 
 import argparse
+import json
 import os
 import re
 import shlex
@@ -184,22 +185,24 @@ def ensure_sdkconfig(board_config):
     port_path = PORT_DIR / board_config["port"]
     board_path = port_path / "boards" / board_config["board"]
 
-    table_csv = board_path / "partitions.csv"
-    if table_csv.exists():
+    partition_csv = board_path / "partitions.csv"
+    if partition_csv.exists():
         flash = "4MB" if board_config.get("flash") is None else board_config["flash"]
-        rel_table_path = table_csv.relative_to(port_path)
+        rel_partition_path = partition_csv.relative_to(port_path)
         sdkconfig += [
             f'CONFIG_ESPTOOLPY_FLASHSIZE="{flash}"',
             f"CONFIG_ESPTOOLPY_FLASHSIZE_{flash}=y",
             "CONFIG_PARTITION_TABLE_CUSTOM=y",
-            f'CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="{rel_table_path}"',
-            f'CONFIG_PARTITION_TABLE_FILENAME="{rel_table_path}"',
+            f'CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="{rel_partition_path}"',
+            f'CONFIG_PARTITION_TABLE_FILENAME="{rel_partition_path}"',
         ]
 
     if board_config.get("sdkconfig") is not None:
         for key, val in board_config["sdkconfig"].items():
             if type(val) is str and val != "y":
                 val = f'"{val}"'
+            elif type(val) is bool:
+                val = "y" if val else ""
             sdkconfig.append(f"CONFIG_{key}={val}")
 
     if len(sdkconfig) > 0:
@@ -228,14 +231,15 @@ def ensure_modules(board_config):
 
         # 模块
         if board_config.get("modules") is not None:
-            ext_modules = {item[0].partition("/")[0]: item for item in read_mods()}
+            ext_modules = ({item[0]: item for item in read_mods()}).items()
             for mod in board_config["modules"]:
                 # 初始模块
-                if mod in ext_modules:
-                    mod_dir, url, ref = ext_modules[mod]
-                    mod_path = MODULES_DIR / Path(mod_dir)
-                    if not (mod_path.exists() or mod_path.is_symlink()):
-                        clone_at(url, ref, mod_path, True)
+                for ext_mod_key, ext_mod in ext_modules:
+                    if mod == ext_mod_key.partition("/")[0]:
+                        mod_dir, url, ref = ext_mod
+                        mod_path = MODULES_DIR / Path(mod_dir)
+                        if not (mod_path.exists() or mod_path.is_symlink()):
+                            clone_at(url, ref, mod_path, False)
 
                 mod_path = Path(mod)
                 if (MODULES_DIR / mod_path).exists():  # ex. lvgl
@@ -271,7 +275,7 @@ def ensure_modules(board_config):
         if (board_path / "modules").exists():
             writeline(f, 'freeze("modules")', manifest)
         else:
-            for mod in ("board_config.py", "boot.py", "main.py"):
+            for mod in ("board_config.py", "boot.py", "main.py", "example.py"):
                 if (board_path / mod).exists():
                     writeline(f, f'module("{mod}")', manifest)
 
@@ -289,7 +293,7 @@ def ensure_board(board_config, arg_board):
     shutil.copytree(
         str(BOARDS_DIR / Path(arg_board)),
         str(board_path),
-        ignore=shutil.ignore_patterns("mpconfig.yml", "*.romfs"),
+        ignore=shutil.ignore_patterns("mpconfig.yml", "romfs", "*.romfs"),
         dirs_exist_ok=True,
     )
 
@@ -334,23 +338,74 @@ def make_board(prefix, board_config):
         print(e.stderr)
         return
 
-    say(f"\nBuilt into {build_path.relative_to(REPO)}")
     for name in ("firmware.bin", "firmware.uf2", "micropython"):
         firmware_path = build_path / name
         if firmware_path.exists():
-            say(f" {firmware_path}")
             return firmware_path
 
 
-def main():
-    parser = argparse.ArgumentParser(description="MicroPython firmware builder.")
-    parser.add_argument("board", help="board")
-    parser.add_argument("--variant")
-    parser.add_argument("--modules", help="comma list: short names, full paths")
-    parser.add_argument("--deploy", action="store_true")
-    parser.add_argument("--release", action="store_true")
-    args = parser.parse_args()
+def esptool_merge_romfs(flasher_args, romfs_img, board_path, output_path):
+    partition_csv = board_path / "partitions.csv"
+    if not partition_csv.exists():
+        return
 
+    cmd = ["esptool.py"]
+    cmd.extend(["--chip", flasher_args.get("extra_esptool_args", {}).get("chip", "")])
+    cmd.extend(["merge_bin", "-o", str(output_path)])
+    cmd.extend(flasher_args.get("write_flash_args", []))
+
+    entries = {}
+    base_path = output_path.parent
+    for addr_str, file_path in flasher_args.get("flash_files", {}).items():
+        entries[int(addr_str, 16)] = (addr_str, str(base_path / Path(file_path)))
+    for addr_int in sorted(entries):
+        addr_str, file_path = entries[addr_int]
+        cmd.extend([addr_str, file_path])
+
+    for line in partition_csv.read_text(encoding="utf-8").splitlines():
+        line = line.partition("#")[0].strip()
+        if line:
+            parts = [p.strip() for p in line.split(",")]
+            if parts[0] == "romfs":
+                cmd.extend([parts[3], str(romfs_img)])
+                break
+    return cmd
+
+
+def make_romfs(prefix, romfs_path, firmware_path):
+    build_path = firmware_path.parent
+
+    flasher_args_json = build_path / "flasher_args.json"
+    if not flasher_args_json.exists():
+        return
+
+    romfs_img = build_path / "romfs.img"
+    output_path = build_path / f"merged_{os.path.basename(firmware_path)}"
+
+    cmds = [["mpremote", "romfs", "-o", str(romfs_img), "build", str(romfs_path)]]
+    with flasher_args_json.open(encoding="utf-8") as f:
+        data = json.load(f)
+        cmd = esptool_merge_romfs(data, romfs_img, romfs_path.parent, output_path)
+        if not cmd:
+            return
+        cmds.append(cmd)
+
+    try:
+        cmds = [shlex.join(c) for c in cmds]
+        run(
+            [BASH, "-c", prefix + " && ".join(cmds)],
+            stdout=None,
+            stderr=subprocess.PIPE,
+            text=True,
+            errors="ignore",
+        )
+    except subprocess.CalledProcessError as e:
+        print(e.stderr)
+        return
+    return output_path
+
+
+def build(args):
     # 检查编译环境
     ensure_micropython(os.environ.get("MICROPY_DIR"))
     make_mpy_cross()
@@ -443,8 +498,17 @@ def main():
     run(["git", "-C", str(MICROPY_DIR), "restore", "."])
     run(["git", "-C", str(MICROPY_DIR), "clean", "-df"])
 
-    if firmware_path is None:
+    # 合并 romfs 资源
+    if firmware_path and firmware_path.exists():
+        romfs_path = BOARDS_DIR / Path(args.board) / "romfs"
+        if romfs_path.exists():
+            firmware_path = make_romfs(prefix, romfs_path, firmware_path)
+
+    if not firmware_path or not firmware_path.exists():
         return
+
+    say(f"\nBuilt into {firmware_path.parent.relative_to(REPO)}")
+    say(f" {firmware_path}")
 
     # 部署
     if args.deploy:
@@ -463,5 +527,32 @@ def main():
         say(f" {firmware_zip}")
 
 
+def restore_micropy(mpconfig_path):
+    if mpconfig_path.exists():
+        shutil.rmtree(board_path, ignore_errors=True)
+    run(["git", "-C", str(MICROPY_DIR), "restore", "."])
+    run(["git", "-C", str(MICROPY_DIR), "clean", "-df"])
+
+
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="MicroPython firmware builder.")
+    parser.add_argument("board", help="board")
+    parser.add_argument("--variant")
+    parser.add_argument("--modules", help="comma list: short names, full paths")
+    parser.add_argument("--deploy", action="store_true")
+    parser.add_argument("--release", action="store_true")
+    args = parser.parse_args()
+
+    try:
+        build(args)
+    except KeyboardInterrupt:
+        mpconfig_path = BOARDS_DIR / Path(args.board) / "mpconfig.yml"
+        if mpconfig_path.exists():
+            board_config = read_config(mpconfig_path)
+            if board_config is not None:
+                port = board_config["port"]
+                board = re.sub(r"[^A-Za-z0-9]+", "_", args.board)
+                board_path = PORT_DIR / port / "boards" / board
+                shutil.rmtree(board_path, ignore_errors=True)
+        run(["git", "-C", str(MICROPY_DIR), "restore", "."])
+        run(["git", "-C", str(MICROPY_DIR), "clean", "-df"])

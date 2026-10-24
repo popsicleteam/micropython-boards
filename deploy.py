@@ -79,6 +79,9 @@ def ensure_espidf(env_path):
 
 def get_firmware(port, board):
     for name in ("firmware.bin", "firmware.uf2", "micropython"):
+        firmware_path = BUILD_DIR / port / board / f"merged_{name}"
+        if firmware_path.exists():
+            return firmware_path
         firmware_path = BUILD_DIR / port / board / name
         if firmware_path.exists():
             return firmware_path

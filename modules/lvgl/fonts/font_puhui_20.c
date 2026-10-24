@@ -163773,9 +163773,9 @@ lv_font_t font_puhui_20 = {
     .user_data = NULL,
 };
 
-// #if (LV_FONT_FMT_TXT_LARGE == 0)
-// #  error "Too large font or glyphs in FONT_PUHUI_20. Enable LV_FONT_FMT_TXT_LARGE in lv_conf.h")
-// #endif
+#if (LV_FONT_FMT_TXT_LARGE == 0)
+#  error "Too large font or glyphs in FONT_PUHUI_20. Enable LV_FONT_FMT_TXT_LARGE in lv_conf.h")
+#endif
 
 
 #endif /*#if FONT_PUHUI_20*/
