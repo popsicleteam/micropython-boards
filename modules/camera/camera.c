@@ -70,7 +70,7 @@ static mp_obj_t camera_init(mp_uint_t n_pos_args, const mp_obj_t* pos_args, mp_m
       {MP_QSTR_pwdn, MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = -1}},
       {MP_QSTR_reset, MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = -1}},
       {MP_QSTR_xclk, MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = -1}},
-      {MP_QSTR_i2c_port, MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 0}},
+      {MP_QSTR_i2c_port, MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = -1}},
       {MP_QSTR_sda, MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = -1}},
       {MP_QSTR_scl, MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = -1}},
       {MP_QSTR_xclk_freq, MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = XCLK_FREQ_20MHz}},
@@ -123,7 +123,7 @@ static mp_obj_t camera_init(mp_uint_t n_pos_args, const mp_obj_t* pos_args, mp_m
   config.ledc_channel = LEDC_CHANNEL_0;
   config.frame_size = (framesize_t)size;
   config.fb_count = args[ARG_FBSIZE].u_int;
-  config.fb_location = args[ARG_FBLOC].u_int;
+  config.fb_location = (camera_fb_location_t)args[ARG_FBLOC].u_int;
   config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
 
   /* 允许首次 init 时 deinit 失败（无实例可卸载），忽略返回值 */
