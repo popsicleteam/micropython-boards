@@ -13,6 +13,10 @@
 
 static const char* TAG = "CAMERA";
 
+/* 上一次成功 init 的配置，供 format / framesize setter 重新 init 时复用 */
+static camera_config_t s_config;
+static bool s_config_valid = false;
+
 /* --------------------------------------------------------------------------
  * 共用校验：像素格式是否合法
  * -------------------------------------------------------------------------- */
@@ -124,7 +128,7 @@ static mp_obj_t camera_init(mp_uint_t n_pos_args, const mp_obj_t* pos_args, mp_m
   config.frame_size = (framesize_t)size;
   config.fb_count = args[ARG_FBSIZE].u_int;
   config.fb_location = (camera_fb_location_t)args[ARG_FBLOC].u_int;
-  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+  config.grab_mode = CAMERA_GRAB_LATEST;
 
   /* 允许首次 init 时 deinit 失败（无实例可卸载），忽略返回值 */
   esp_camera_deinit();
@@ -134,6 +138,10 @@ static mp_obj_t camera_init(mp_uint_t n_pos_args, const mp_obj_t* pos_args, mp_m
     mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("Camera Init Failed"));
     return mp_const_false;
   }
+
+  /* 保存完整配置，供 format / framesize setter 重新 init 时复用 */
+  s_config = config;
+  s_config_valid = true;
   return mp_const_true;
 }
 static MP_DEFINE_CONST_FUN_OBJ_KW(camera_init_obj, 0, camera_init);
@@ -147,18 +155,46 @@ static mp_obj_t camera_deinit() {
     ESP_LOGE(TAG, "Camera deinit Failed");
     return mp_const_false;
   }
+  s_config_valid = false;
   return mp_const_true;
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(camera_deinit_obj, camera_deinit);
 
 /* --------------------------------------------------------------------------
- * camera.snapshot()
+ * camera.snapshot(*, swap_bytes=False)
+ *
+ *   swap_bytes=False (默认)：返回原始字节流，行为与旧版本一致
+ *   swap_bytes=True        ：仅当当前格式为 RGB565 时，对每个 16bit 像素
+ *                            交换高低字节（字节序交换）
+ *                            （其他格式忽略该参数，原样返回）
+ *
+ * 注意：swap_bytes 是“仅关键字参数”，只能写成 camera.snapshot(swap_bytes=True)；
+ *       位置参数调用 camera.snapshot(True) 会抛 TypeError。
  * -------------------------------------------------------------------------- */
-static mp_obj_t camera_snapshot() {
+static mp_obj_t camera_snapshot(size_t n_pos_args, const mp_obj_t* pos_args, mp_map_t* kw_args) {
+  enum { ARG_swap_bytes };
+  static const mp_arg_t allowed_args[] = {
+      {MP_QSTR_swap_bytes, MP_ARG_BOOL | MP_ARG_KW_ONLY, {.u_bool = false}},
+  };
+  mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
+  mp_arg_parse_all(n_pos_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, args);
+
+  bool swap_bytes = args[ARG_swap_bytes].u_bool;
+
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb) {
     ESP_LOGE(TAG, "Camera Capture Failed");
     return mp_const_false;
+  }
+
+  /* 仅在 RGB565 格式下交换字节；JPEG/GRAYSCALE/YUV 等保持原样 */
+  if (swap_bytes && fb->format == PIXFORMAT_RGB565) {
+    /* 每个像素 2 字节，fb->len 应为偶数；容忍奇数长度的极端情况 */
+    uint16_t* pixels = (uint16_t*)fb->buf;
+    size_t pixel_count = fb->len / 2;
+    for (size_t i = 0; i < pixel_count; i++) {
+      pixels[i] = (uint16_t)((pixels[i] >> 8) | (pixels[i] << 8));
+    }
   }
 
   mp_obj_t image = mp_obj_new_bytes(fb->buf, fb->len);
@@ -166,7 +202,7 @@ static mp_obj_t camera_snapshot() {
   esp_camera_fb_return(fb);
   return image;
 }
-static MP_DEFINE_CONST_FUN_OBJ_0(camera_snapshot_obj, camera_snapshot);
+static MP_DEFINE_CONST_FUN_OBJ_KW(camera_snapshot_obj, 0, camera_snapshot);
 
 /* --------------------------------------------------------------------------
  * camera.jpeg([quality])
@@ -264,6 +300,10 @@ static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(camera_mirror_obj, 0, 1, camera_mirro
 
 /* --------------------------------------------------------------------------
  * camera.format([format])
+ *
+ *   getter：从 sensor 读取当前像素格式
+ *   setter：修改 s_config.pixel_format 后走 deinit + init（与 camera_init 同一套逻辑）
+ *           失败则回滚一次，尽量保持相机可用
  * -------------------------------------------------------------------------- */
 static mp_obj_t camera_format(size_t n_args, const mp_obj_t* args) {
   sensor_t* s = esp_camera_sensor_get();
@@ -272,6 +312,7 @@ static mp_obj_t camera_format(size_t n_args, const mp_obj_t* args) {
     return mp_const_false;
   }
 
+  /* getter */
   if (n_args == 0) {
     return mp_obj_new_int((int)s->pixformat);
   }
@@ -281,13 +322,39 @@ static mp_obj_t camera_format(size_t n_args, const mp_obj_t* args) {
     mp_raise_ValueError(MP_ERROR_TEXT("Image format is not valid"));
   }
 
-  esp_err_t err = s->set_pixformat(s, (pixformat_t)format);
-  return (err == ESP_OK) ? mp_const_true : mp_const_false;
+  if (!s_config_valid) {
+    ESP_LOGE(TAG, "Camera not initialized");
+    return mp_const_false;
+  }
+
+  /* 与当前格式相同：忽略，不重新 init */
+  if (s->pixformat == (pixformat_t)format) {
+    return mp_const_true;
+  }
+
+  /* setter：改配置后重新 init */
+  pixformat_t old = s_config.pixel_format;
+  s_config.pixel_format = (pixformat_t)format;
+
+  esp_camera_deinit();
+  if (esp_camera_init(&s_config) != ESP_OK) {
+    /* 回滚一次，尽量保持相机可用 */
+    s_config.pixel_format = old;
+    esp_camera_deinit();
+    (void)esp_camera_init(&s_config);
+    ESP_LOGE(TAG, "Camera re-init failed");
+    return mp_const_false;
+  }
+  return mp_const_true;
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(camera_format_obj, 0, 1, camera_format);
 
 /* --------------------------------------------------------------------------
  * camera.framesize([size])
+ *
+ *   getter：从 sensor 读取当前分辨率并返回 (width, height)
+ *   setter：修改 s_config.frame_size 后走 deinit + init
+ *           失败则回滚一次，尽量保持相机可用
  * -------------------------------------------------------------------------- */
 static bool framesize_to_resolution(int size, int* width, int* height) {
   if (size < 0 || size >= FRAMESIZE_INVALID) {
@@ -305,6 +372,7 @@ static mp_obj_t camera_framesize(size_t n_args, const mp_obj_t* args) {
     return mp_const_false;
   }
 
+  /* getter */
   if (n_args == 0) {
     int width = 0, height = 0;
     (void)framesize_to_resolution((int)s->status.framesize, &width, &height);
@@ -320,8 +388,29 @@ static mp_obj_t camera_framesize(size_t n_args, const mp_obj_t* args) {
     mp_raise_ValueError(MP_ERROR_TEXT("Image framesize is not valid"));
   }
 
-  esp_err_t err = s->set_framesize(s, (framesize_t)size);
-  return (err == ESP_OK) ? mp_const_true : mp_const_false;
+  if (!s_config_valid) {
+    ESP_LOGE(TAG, "Camera not initialized");
+    return mp_const_false;
+  }
+
+  /* 与当前分辨率相同：忽略，不重新 init */
+  if (s->status.framesize == (framesize_t)size) {
+    return mp_const_true;
+  }
+
+  /* setter：改配置后重新 init */
+  framesize_t old = s_config.frame_size;
+  s_config.frame_size = (framesize_t)size;
+
+  esp_camera_deinit();
+  if (esp_camera_init(&s_config) != ESP_OK) {
+    s_config.frame_size = old;
+    esp_camera_deinit();
+    (void)esp_camera_init(&s_config);
+    ESP_LOGE(TAG, "Camera re-init failed");
+    return mp_const_false;
+  }
+  return mp_const_true;
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(camera_framesize_obj, 0, 1, camera_framesize);
 
