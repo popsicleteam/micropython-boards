@@ -27,6 +27,65 @@ static bool is_valid_format(int format) {
 }
 
 /* --------------------------------------------------------------------------
+ * Sensor 运行时设置快照 / 恢复
+ *
+ *   quality / contrast / saturation / brightness / special_effect / wb_mode /
+ *   hmirror / vflip 这些是 sensor 内部状态，esp_camera_init() 会重置成默认值。
+ *   在 format / framesize setter 触发的 deinit + init 前后，需要手动保存/恢复，
+ *   否则用户通过 camera.flip() / camera.mirror() 等设置的值会被清掉。
+ *
+ *   注意：必须在 esp_camera_deinit() 之前 save（deinit 之后 sensor_get 返回 NULL）。
+ * -------------------------------------------------------------------------- */
+typedef struct {
+  bool valid;
+  int quality;
+  int contrast;
+  int saturation;
+  int brightness;
+  int special_effect;
+  int wb_mode;
+  int hmirror;
+  int vflip;
+} sensor_settings_t;
+
+static sensor_settings_t s_sensor_settings;
+
+static void sensor_settings_save(void) {
+  sensor_t* s = esp_camera_sensor_get();
+  if (!s) {
+    return;
+  }
+  s_sensor_settings.quality = s->status.quality;
+  s_sensor_settings.contrast = s->status.contrast;
+  s_sensor_settings.saturation = s->status.saturation;
+  s_sensor_settings.brightness = s->status.brightness;
+  s_sensor_settings.special_effect = s->status.special_effect;
+  s_sensor_settings.wb_mode = s->status.wb_mode;
+  s_sensor_settings.hmirror = s->status.hmirror;
+  s_sensor_settings.vflip = s->status.vflip;
+  s_sensor_settings.valid = true;
+}
+
+static void sensor_settings_restore(void) {
+  if (!s_sensor_settings.valid) {
+    return;
+  }
+  sensor_t* s = esp_camera_sensor_get();
+  if (!s) {
+    return;
+  }
+  /* 逐项恢复；部分驱动可能没有实现对应回调，需判空 */
+  if (s->set_quality) (void)s->set_quality(s, s_sensor_settings.quality);
+  if (s->set_contrast) (void)s->set_contrast(s, s_sensor_settings.contrast);
+  if (s->set_saturation) (void)s->set_saturation(s, s_sensor_settings.saturation);
+  if (s->set_brightness) (void)s->set_brightness(s, s_sensor_settings.brightness);
+  if (s->set_special_effect) (void)s->set_special_effect(s, s_sensor_settings.special_effect);
+  if (s->set_wb_mode) (void)s->set_wb_mode(s, s_sensor_settings.wb_mode);
+  if (s->set_hmirror) (void)s->set_hmirror(s, s_sensor_settings.hmirror);
+  if (s->set_vflip) (void)s->set_vflip(s, s_sensor_settings.vflip);
+}
+
+/* --------------------------------------------------------------------------
  * camera.init(*)
  * -------------------------------------------------------------------------- */
 static mp_obj_t camera_init(mp_uint_t n_pos_args, const mp_obj_t* pos_args, mp_map_t* kw_args) {
@@ -156,6 +215,7 @@ static mp_obj_t camera_deinit() {
     return mp_const_false;
   }
   s_config_valid = false;
+  s_sensor_settings.valid = false;
   return mp_const_true;
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(camera_deinit_obj, camera_deinit);
@@ -303,7 +363,8 @@ static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(camera_mirror_obj, 0, 1, camera_mirro
  *
  *   getter：从 sensor 读取当前像素格式
  *   setter：修改 s_config.pixel_format 后走 deinit + init（与 camera_init 同一套逻辑）
- *           失败则回滚一次，尽量保持相机可用
+ *           期间会保存并恢复 sensor 的运行时设置（quality/mirror/flip/...），
+ *           避免重新 init 把它们清掉。失败则回滚一次，尽量保持相机可用。
  * -------------------------------------------------------------------------- */
 static mp_obj_t camera_format(size_t n_args, const mp_obj_t* args) {
   sensor_t* s = esp_camera_sensor_get();
@@ -336,15 +397,20 @@ static mp_obj_t camera_format(size_t n_args, const mp_obj_t* args) {
   pixformat_t old = s_config.pixel_format;
   s_config.pixel_format = (pixformat_t)format;
 
+  /* 在 deinit 之前保存 sensor 运行时设置 */
+  sensor_settings_save();
+
   esp_camera_deinit();
   if (esp_camera_init(&s_config) != ESP_OK) {
     /* 回滚一次，尽量保持相机可用 */
     s_config.pixel_format = old;
     esp_camera_deinit();
     (void)esp_camera_init(&s_config);
+    sensor_settings_restore();
     ESP_LOGE(TAG, "Camera re-init failed");
     return mp_const_false;
   }
+  sensor_settings_restore();
   return mp_const_true;
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(camera_format_obj, 0, 1, camera_format);
@@ -354,7 +420,8 @@ static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(camera_format_obj, 0, 1, camera_forma
  *
  *   getter：从 sensor 读取当前分辨率并返回 (width, height)
  *   setter：修改 s_config.frame_size 后走 deinit + init
- *           失败则回滚一次，尽量保持相机可用
+ *           期间会保存并恢复 sensor 的运行时设置（quality/mirror/flip/...），
+ *           失败则回滚一次，尽量保持相机可用。
  * -------------------------------------------------------------------------- */
 static bool framesize_to_resolution(int size, int* width, int* height) {
   if (size < 0 || size >= FRAMESIZE_INVALID) {
@@ -402,14 +469,19 @@ static mp_obj_t camera_framesize(size_t n_args, const mp_obj_t* args) {
   framesize_t old = s_config.frame_size;
   s_config.frame_size = (framesize_t)size;
 
+  /* 在 deinit 之前保存 sensor 运行时设置 */
+  sensor_settings_save();
+
   esp_camera_deinit();
   if (esp_camera_init(&s_config) != ESP_OK) {
     s_config.frame_size = old;
     esp_camera_deinit();
     (void)esp_camera_init(&s_config);
+    sensor_settings_restore();
     ESP_LOGE(TAG, "Camera re-init failed");
     return mp_const_false;
   }
+  sensor_settings_restore();
   return mp_const_true;
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(camera_framesize_obj, 0, 1, camera_framesize);
