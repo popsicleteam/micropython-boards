@@ -1,3 +1,4 @@
 c_module(".")
 
-include("./binding/ports/esp32")
+module("lv_display.py", base_path=".", opt=3)
+module("lv_touch.py", base_path=".", opt=3)

@@ -256,14 +256,14 @@ def ensure_modules(board_config):
                 else:  # ex. aioble
                     writeline(f, f'require("{mod}")', manifest)
 
-        # 驱动模块
-        if board_config.get("drivers") is not None:
-            for drv in board_config["drivers"]:
+        # 设备驱动
+        if board_config.get("devices") is not None:
+            for drv in board_config["devices"]:
                 drv_path = Path(drv)
-                if (MODULES_DIR / "drivers" / drv_path).exists():
+                if (MODULES_DIR / "devices" / drv_path).exists():
                     writeline(
                         f,
-                        f'include("$(MPY_DIR)/../modules/drivers/{drv_path}")',
+                        f'include("$(MPY_DIR)/../modules/devices/{drv_path}")',
                         manifest,
                     )
 
@@ -324,18 +324,15 @@ def make_board(prefix, board_config):
         if variant:
             make.append(f"BOARD_VARIANT={variant}")
 
-    subprocess.call([BASH, "-c", prefix + shlex.join(make + ["clean"])])
+    subprocess.run(
+        [BASH, "-c", prefix + shlex.join(make + ["clean"])],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
     try:
         cmds = [shlex.join(c) for c in [make + ["submodules"], make]]
-        run(
-            [BASH, "-c", prefix + " && ".join(cmds)],
-            stdout=None,
-            stderr=subprocess.PIPE,
-            text=True,
-            errors="ignore",
-        )
-    except subprocess.CalledProcessError as e:
-        print(e.stderr)
+        run([BASH, "-c", prefix + " && ".join(cmds)])
+    except subprocess.CalledProcessError:
         return
 
     for name in ("firmware.bin", "firmware.uf2", "micropython"):
@@ -392,15 +389,8 @@ def make_romfs(prefix, romfs_path, firmware_path):
 
     try:
         cmds = [shlex.join(c) for c in cmds]
-        run(
-            [BASH, "-c", prefix + " && ".join(cmds)],
-            stdout=None,
-            stderr=subprocess.PIPE,
-            text=True,
-            errors="ignore",
-        )
-    except subprocess.CalledProcessError as e:
-        print(e.stderr)
+        run([BASH, "-c", prefix + " && ".join(cmds)])
+    except subprocess.CalledProcessError:
         return
     return output_path
 
@@ -473,10 +463,15 @@ def build(args):
                     mpconfigboard,
                 )
 
-    # 修改默认 MICROPY_BANNER 显示文本
+    # 修复 MICROPY_HW_BOARD_NAME 重复定义，修改默认 MICROPY_BANNER 显示文本
     mpconfigboard_h = board_path / "mpconfigboard.h"
+    mpconfigboard = mpconfigboard_h.read_text()
+    mpconfigboard_h.write_text(
+        "#ifdef MICROPY_HW_BOARD_NAME\n#undef MICROPY_HW_BOARD_NAME\n#endif\n"
+        + mpconfigboard,
+        encoding="utf-8",
+    )
     with open(mpconfigboard_h, "a", encoding="utf-8") as f:
-        mpconfigboard = mpconfigboard_h.read_text()
         writeline(
             f,
             '#define MICROPY_BANNER_NAME_AND_VERSION "MicroPython v" MICROPY_VERSION_STRING_BASE " on " MICROPY_BUILD_DATE',
@@ -493,10 +488,7 @@ def build(args):
     firmware_path = make_board(prefix, board_config)
 
     # 清理
-    if mpconfig_path.exists():
-        shutil.rmtree(board_path, ignore_errors=True)
-    run(["git", "-C", str(MICROPY_DIR), "restore", "."])
-    run(["git", "-C", str(MICROPY_DIR), "clean", "-df"])
+    restore_micropy(mpconfig_path)
 
     # 合并 romfs 资源
     if firmware_path and firmware_path.exists():
@@ -529,7 +521,12 @@ def build(args):
 
 def restore_micropy(mpconfig_path):
     if mpconfig_path.exists():
-        shutil.rmtree(board_path, ignore_errors=True)
+        board_config = read_config(mpconfig_path)
+        if board_config is not None:
+            port = board_config["port"]
+            board = re.sub(r"[^A-Za-z0-9]+", "_", args.board)
+            board_path = PORT_DIR / port / "boards" / board
+            shutil.rmtree(board_path, ignore_errors=True)
     run(["git", "-C", str(MICROPY_DIR), "restore", "."])
     run(["git", "-C", str(MICROPY_DIR), "clean", "-df"])
 
@@ -546,13 +543,4 @@ if __name__ == "__main__":
     try:
         build(args)
     except KeyboardInterrupt:
-        mpconfig_path = BOARDS_DIR / Path(args.board) / "mpconfig.yml"
-        if mpconfig_path.exists():
-            board_config = read_config(mpconfig_path)
-            if board_config is not None:
-                port = board_config["port"]
-                board = re.sub(r"[^A-Za-z0-9]+", "_", args.board)
-                board_path = PORT_DIR / port / "boards" / board
-                shutil.rmtree(board_path, ignore_errors=True)
-        run(["git", "-C", str(MICROPY_DIR), "restore", "."])
-        run(["git", "-C", str(MICROPY_DIR), "clean", "-df"])
+        restore_micropy(BOARDS_DIR / Path(args.board) / "mpconfig.yml")

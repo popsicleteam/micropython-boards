@@ -1,1 +1,0 @@
-../../../lvgl/binding/driver/generic/ft6x36.py

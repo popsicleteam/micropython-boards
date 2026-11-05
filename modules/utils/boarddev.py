@@ -6,7 +6,32 @@ except ImportError:
         pass
 
 
+try:
+    from lv_display import lv_display_register
+except ImportError:
+    lv_display_register = None
+
+
+try:
+    from lv_touch import lv_touch_register
+except ImportError:
+    lv_touch_register = None
+
+
 _devices = {}
+
+# 注册 LVGL 屏幕和触摸输入
+if lv_display_register is not None:
+    _devices["display"] = lv_display_register(
+        getattr(board_config, "display", None),
+        getattr(board_config, "display_doublebuffer", True),
+        getattr(board_config, "display_factor", 4),
+    )
+if lv_touch_register is not None:
+    _devices["touch"] = lv_touch_register(
+        getattr(board_config, "touch", None),
+        getattr(board_config, "touch_max_point", None),
+    )
 
 
 def __getattr__(name):
@@ -25,7 +50,7 @@ def __getattr__(name):
             rst = attr(*args, **kwargs)
             if rst:
                 _devices[key] = rst
-            return bool(rst)
+            return False
 
         return init
 
@@ -34,11 +59,8 @@ def __getattr__(name):
 
         def deinit(*args, **kwargs):
             if _devices.get(key, None):
-                rst = attr(*args, **kwargs)
-                if rst:
-                    _devices[key] = None
-                return bool(rst)
-            return False
+                attr(*args, **kwargs)
+                _devices.pop(key)
 
         return deinit
 

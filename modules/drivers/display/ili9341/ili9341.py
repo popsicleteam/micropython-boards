@@ -1,1 +1,0 @@
-../../../lvgl/binding/driver/generic/ili9xxx.py
