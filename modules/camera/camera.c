@@ -13,9 +13,30 @@
 
 static const char* TAG = "CAMERA";
 
+/* --------------------------------------------------------------------------
+ * 模块状态
+ * -------------------------------------------------------------------------- */
+
 /* 上一次成功 init 的配置，供 format / framesize setter 重新 init 时复用 */
 static camera_config_t s_config;
 static bool s_config_valid = false;
+
+/* 零拷贝 snapshot 暂存的 fb。
+ * camera.snapshot() 返回的 memoryview 直接指向它；以下时机自动归还：
+ *   - 下一次 camera.snapshot() 调用
+ *   - camera.release() 调用
+ *   - camera.init() / camera.deinit() 调用
+ *   - camera.format() setter / camera.framesize() setter
+ * 调用者必须在上述时机之前用完 memoryview，否则数据会被下一帧覆盖。
+ */
+static camera_fb_t* s_pending_fb = NULL;
+
+static void pending_fb_release(void) {
+  if (s_pending_fb) {
+    esp_camera_fb_return(s_pending_fb);
+    s_pending_fb = NULL;
+  }
+}
 
 /* --------------------------------------------------------------------------
  * 共用校验：像素格式是否合法
@@ -86,6 +107,42 @@ static void sensor_settings_restore(void) {
 }
 
 /* --------------------------------------------------------------------------
+ * 重新 init（format / framesize setter 共用）
+ *
+ *   - 修改前调用者已经把新值写入 s_config；
+ *   - 传入旧值用于失败回滚；
+ *   - 返回 true 表示成功；false 表示失败（已尝试回滚一次）。
+ * -------------------------------------------------------------------------- */
+static bool camera_reinit(pixformat_t old_format, framesize_t old_size) {
+  /* 1. 保存 sensor 运行时设置并归还 pending fb（二者都必须在 deinit 之前） */
+  sensor_settings_save();
+  pending_fb_release();
+
+  /* 2. 用新配置 init */
+  esp_camera_deinit();
+  if (esp_camera_init(&s_config) == ESP_OK) {
+    sensor_settings_restore();
+    return true;
+  }
+
+  /* 3. 失败：回滚一次，尽量保持相机可用 */
+  ESP_LOGE(TAG, "Camera re-init failed, rolling back");
+  s_config.pixel_format = old_format;
+  s_config.frame_size = old_size;
+  esp_camera_deinit();
+  if (esp_camera_init(&s_config) == ESP_OK) {
+    sensor_settings_restore();
+    return false;
+  }
+
+  /* 4. 回滚也失败：相机不可用，后续 setter 应拒绝 */
+  ESP_LOGE(TAG, "Camera rollback failed, camera unavailable");
+  s_config_valid = false;
+  s_sensor_settings.valid = false;
+  return false;
+}
+
+/* --------------------------------------------------------------------------
  * camera.init(*)
  * -------------------------------------------------------------------------- */
 static mp_obj_t camera_init(mp_uint_t n_pos_args, const mp_obj_t* pos_args, mp_map_t* kw_args) {
@@ -111,7 +168,7 @@ static mp_obj_t camera_init(mp_uint_t n_pos_args, const mp_obj_t* pos_args, mp_m
     ARG_SIOD,
     ARG_SIOC,
     ARG_FREQ,
-    ARG_FBSIZE,
+    ARG_FBCOUNT,
     ARG_FBLOC,
   };
 
@@ -160,6 +217,11 @@ static mp_obj_t camera_init(mp_uint_t n_pos_args, const mp_obj_t* pos_args, mp_m
     mp_raise_ValueError(MP_ERROR_TEXT("xclk frequency is not valid"));
   }
 
+  int fb_count = args[ARG_FBCOUNT].u_int;
+  if (fb_count < 1) {
+    mp_raise_ValueError(MP_ERROR_TEXT("fb_count must be >= 1"));
+  }
+
   /* 用 {0} 初始化，未显式赋值的字段不会带栈垃圾值 */
   camera_config_t config = {0};
   config.pin_d0 = args[ARG_d0].u_int;
@@ -185,12 +247,14 @@ static mp_obj_t camera_init(mp_uint_t n_pos_args, const mp_obj_t* pos_args, mp_m
   config.ledc_timer = LEDC_TIMER_0;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.frame_size = (framesize_t)size;
-  config.fb_count = args[ARG_FBSIZE].u_int;
+  config.fb_count = fb_count;
   config.fb_location = (camera_fb_location_t)args[ARG_FBLOC].u_int;
   config.grab_mode = CAMERA_GRAB_LATEST;
 
-  /* 允许首次 init 时 deinit 失败（无实例可卸载），忽略返回值 */
+  /* 归还 pending fb，再 deinit（首次 init 时 deinit 可能失败，忽略返回值） */
+  pending_fb_release();
   esp_camera_deinit();
+
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "Camera Init Failed");
@@ -209,6 +273,9 @@ static MP_DEFINE_CONST_FUN_OBJ_KW(camera_init_obj, 0, camera_init);
  * camera.deinit()
  * -------------------------------------------------------------------------- */
 static mp_obj_t camera_deinit() {
+  /* 必须在 esp_camera_deinit() 之前归还 pending fb */
+  pending_fb_release();
+
   esp_err_t err = esp_camera_deinit();
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "Camera deinit Failed");
@@ -221,25 +288,33 @@ static mp_obj_t camera_deinit() {
 static MP_DEFINE_CONST_FUN_OBJ_0(camera_deinit_obj, camera_deinit);
 
 /* --------------------------------------------------------------------------
- * camera.snapshot(*, swap_bytes=False)
+ * camera.snapshot(*, swap_bytes=False, buffer=None)
  *
- *   swap_bytes=False (默认)：返回原始字节流，行为与旧版本一致
- *   swap_bytes=True        ：仅当当前格式为 RGB565 时，对每个 16bit 像素
- *                            交换高低字节（字节序交换）
- *                            （其他格式忽略该参数，原样返回）
- *
- * 注意：swap_bytes 是“仅关键字参数”，只能写成 camera.snapshot(swap_bytes=True)；
- *       位置参数调用 camera.snapshot(True) 会抛 TypeError。
+ *   buffer=None ：零拷贝，返回指向驱动 fb 的 memoryview（延迟归还）。
+ *   buffer=<writable buffer> ：把 fb 数据拷进 buffer，立即归还 fb，
+ *                              返回 True / False。
  * -------------------------------------------------------------------------- */
 static mp_obj_t camera_snapshot(size_t n_pos_args, const mp_obj_t* pos_args, mp_map_t* kw_args) {
-  enum { ARG_swap_bytes };
+  enum { ARG_swap_bytes, ARG_buffer };
   static const mp_arg_t allowed_args[] = {
       {MP_QSTR_swap_bytes, MP_ARG_BOOL | MP_ARG_KW_ONLY, {.u_bool = false}},
+      {MP_QSTR_buffer, MP_ARG_OBJ | MP_ARG_KW_ONLY, {.u_rom_obj = MP_ROM_NONE}},
   };
   mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
   mp_arg_parse_all(n_pos_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, args);
 
   bool swap_bytes = args[ARG_swap_bytes].u_bool;
+  mp_obj_t buffer_obj = args[ARG_buffer].u_obj;
+  bool use_buffer = (buffer_obj != mp_const_none);
+
+  /* 校验用户 buffer（仅拷贝路径） */
+  mp_buffer_info_t bufinfo = {0};
+  if (use_buffer && !mp_get_buffer(buffer_obj, &bufinfo, MP_BUFFER_WRITE)) {
+    mp_raise_TypeError(MP_ERROR_TEXT("buffer must be writable and support buffer protocol"));
+  }
+
+  /* 两条路径都先归还上一帧，避免 fb 池耗尽 */
+  pending_fb_release();
 
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb) {
@@ -247,22 +322,42 @@ static mp_obj_t camera_snapshot(size_t n_pos_args, const mp_obj_t* pos_args, mp_
     return mp_const_false;
   }
 
-  /* 仅在 RGB565 格式下交换字节；JPEG/GRAYSCALE/YUV 等保持原样 */
+  if (use_buffer && fb->len > bufinfo.len) {
+    esp_camera_fb_return(fb);
+    mp_raise_ValueError(MP_ERROR_TEXT("buffer too small"));
+  }
+
+  /* 可选字节序交换，作用于 fb->buf（RGB565 每像素 2 字节） */
   if (swap_bytes && fb->format == PIXFORMAT_RGB565) {
-    /* 每个像素 2 字节，fb->len 应为偶数；容忍奇数长度的极端情况 */
-    uint16_t* pixels = (uint16_t*)fb->buf;
-    size_t pixel_count = fb->len / 2;
-    for (size_t i = 0; i < pixel_count; i++) {
-      pixels[i] = (uint16_t)((pixels[i] >> 8) | (pixels[i] << 8));
+    uint16_t* px = (uint16_t*)fb->buf;
+    for (size_t i = 0; i < fb->len / 2; i++) {
+      px[i] = (uint16_t)((px[i] >> 8) | (px[i] << 8));
     }
   }
 
-  mp_obj_t image = mp_obj_new_bytes(fb->buf, fb->len);
+  /* 收尾：拷贝路径立即归还，零拷贝路径暂存后返回 memoryview */
+  if (use_buffer) {
+    memcpy(bufinfo.buf, fb->buf, fb->len);
+    esp_camera_fb_return(fb);
+    return mp_const_true;
+  }
 
-  esp_camera_fb_return(fb);
-  return image;
+  s_pending_fb = fb;
+  return mp_obj_new_memoryview('B', fb->len, fb->buf);
 }
 static MP_DEFINE_CONST_FUN_OBJ_KW(camera_snapshot_obj, 0, camera_snapshot);
+
+/* --------------------------------------------------------------------------
+ * camera.release()
+ *
+ *   显式归还上一次 snapshot() 持有的 fb；用户想尽早释放时调用。
+ *   未持有 pending fb 时调用是安全的（空操作）。
+ * -------------------------------------------------------------------------- */
+static mp_obj_t camera_release(void) {
+  pending_fb_release();
+  return mp_const_true;
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(camera_release_obj, camera_release);
 
 /* --------------------------------------------------------------------------
  * camera.jpeg([quality])
@@ -276,6 +371,9 @@ static mp_obj_t camera_jpeg(size_t n_pos_args, const mp_obj_t* pos_args, mp_map_
   mp_arg_parse_all(n_pos_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, args);
 
   int quality_arg = args[ARG_quality].u_int;
+
+  /* 先归还 pending fb，避免和本次采集争用 buffer */
+  pending_fb_release();
 
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb) {
@@ -332,6 +430,10 @@ static mp_obj_t camera_flip(size_t n_args, const mp_obj_t* args) {
     return mp_obj_new_int(s->status.vflip);
   }
 
+  if (!s->set_vflip) {
+    return mp_const_false;
+  }
+
   int dir = mp_obj_get_int(args[0]);
   esp_err_t err = s->set_vflip(s, dir);
   return (err == ESP_OK) ? mp_const_true : mp_const_false;
@@ -350,6 +452,10 @@ static mp_obj_t camera_mirror(size_t n_args, const mp_obj_t* args) {
 
   if (n_args == 0) {
     return mp_obj_new_int(s->status.hmirror);
+  }
+
+  if (!s->set_hmirror) {
+    return mp_const_false;
   }
 
   int dir = mp_obj_get_int(args[0]);
@@ -393,25 +499,11 @@ static mp_obj_t camera_format(size_t n_args, const mp_obj_t* args) {
     return mp_const_true;
   }
 
-  /* setter：改配置后重新 init */
-  pixformat_t old = s_config.pixel_format;
+  /* setter：改配置后重新 init；失败已由 camera_reinit 回滚 */
+  pixformat_t old_format = s_config.pixel_format;
+  framesize_t old_size = s_config.frame_size;
   s_config.pixel_format = (pixformat_t)format;
-
-  /* 在 deinit 之前保存 sensor 运行时设置 */
-  sensor_settings_save();
-
-  esp_camera_deinit();
-  if (esp_camera_init(&s_config) != ESP_OK) {
-    /* 回滚一次，尽量保持相机可用 */
-    s_config.pixel_format = old;
-    esp_camera_deinit();
-    (void)esp_camera_init(&s_config);
-    sensor_settings_restore();
-    ESP_LOGE(TAG, "Camera re-init failed");
-    return mp_const_false;
-  }
-  sensor_settings_restore();
-  return mp_const_true;
+  return camera_reinit(old_format, old_size) ? mp_const_true : mp_const_false;
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(camera_format_obj, 0, 1, camera_format);
 
@@ -419,9 +511,8 @@ static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(camera_format_obj, 0, 1, camera_forma
  * camera.framesize([size])
  *
  *   getter：从 sensor 读取当前分辨率并返回 (width, height)
- *   setter：修改 s_config.frame_size 后走 deinit + init
- *           期间会保存并恢复 sensor 的运行时设置（quality/mirror/flip/...），
- *           失败则回滚一次，尽量保持相机可用。
+ *   setter：修改 s_config.frame_size 后走 deinit + init（复用 camera_reinit）
+ *           期间会保存并恢复 sensor 的运行时设置；失败则回滚一次。
  * -------------------------------------------------------------------------- */
 static bool framesize_to_resolution(int size, int* width, int* height) {
   if (size < 0 || size >= FRAMESIZE_INVALID) {
@@ -465,24 +556,11 @@ static mp_obj_t camera_framesize(size_t n_args, const mp_obj_t* args) {
     return mp_const_true;
   }
 
-  /* setter：改配置后重新 init */
-  framesize_t old = s_config.frame_size;
+  /* setter：改配置后重新 init；失败已由 camera_reinit 回滚 */
+  pixformat_t old_format = s_config.pixel_format;
+  framesize_t old_size = s_config.frame_size;
   s_config.frame_size = (framesize_t)size;
-
-  /* 在 deinit 之前保存 sensor 运行时设置 */
-  sensor_settings_save();
-
-  esp_camera_deinit();
-  if (esp_camera_init(&s_config) != ESP_OK) {
-    s_config.frame_size = old;
-    esp_camera_deinit();
-    (void)esp_camera_init(&s_config);
-    sensor_settings_restore();
-    ESP_LOGE(TAG, "Camera re-init failed");
-    return mp_const_false;
-  }
-  sensor_settings_restore();
-  return mp_const_true;
+  return camera_reinit(old_format, old_size) ? mp_const_true : mp_const_false;
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(camera_framesize_obj, 0, 1, camera_framesize);
 
@@ -498,6 +576,10 @@ static mp_obj_t camera_quality(size_t n_args, const mp_obj_t* args) {
 
   if (n_args == 0) {
     return mp_obj_new_int(s->status.quality);
+  }
+
+  if (!s->set_quality) {
+    return mp_const_false;
   }
 
   int val = mp_obj_get_int(args[0]);  // 10-63 lower number means higher quality
@@ -522,6 +604,10 @@ static mp_obj_t camera_contrast(size_t n_args, const mp_obj_t* args) {
     return mp_obj_new_int(s->status.contrast);
   }
 
+  if (!s->set_contrast) {
+    return mp_const_false;
+  }
+
   int val = mp_obj_get_int(args[0]);
   esp_err_t err = s->set_contrast(s, val);  // -2,2 (default 0). 2 highcontrast
   return (err == ESP_OK) ? mp_const_true : mp_const_false;
@@ -542,6 +628,10 @@ static mp_obj_t camera_saturation(size_t n_args, const mp_obj_t* args) {
     return mp_obj_new_int(s->status.saturation);
   }
 
+  if (!s->set_saturation) {
+    return mp_const_false;
+  }
+
   int val = mp_obj_get_int(args[0]);
   esp_err_t err = s->set_saturation(s, val);  // -2,2 (default 0). -2 grayscale
   return (err == ESP_OK) ? mp_const_true : mp_const_false;
@@ -560,6 +650,10 @@ static mp_obj_t camera_brightness(size_t n_args, const mp_obj_t* args) {
 
   if (n_args == 0) {
     return mp_obj_new_int(s->status.brightness);
+  }
+
+  if (!s->set_brightness) {
+    return mp_const_false;
   }
 
   int val = mp_obj_get_int(args[0]);
@@ -584,6 +678,10 @@ static mp_obj_t camera_speffect(size_t n_args, const mp_obj_t* args) {
     return mp_obj_new_int(s->status.special_effect);
   }
 
+  if (!s->set_special_effect) {
+    return mp_const_false;
+  }
+
   int val = mp_obj_get_int(args[0]);
   esp_err_t err = s->set_special_effect(s, val);
   return (err == ESP_OK) ? mp_const_true : mp_const_false;
@@ -605,6 +703,10 @@ static mp_obj_t camera_whitebalance(size_t n_args, const mp_obj_t* args) {
     return mp_obj_new_int(s->status.wb_mode);
   }
 
+  if (!s->set_wb_mode) {
+    return mp_const_false;
+  }
+
   int val = mp_obj_get_int(args[0]);
   esp_err_t err = s->set_wb_mode(s, val);
   return (err == ESP_OK) ? mp_const_true : mp_const_false;
@@ -620,6 +722,7 @@ static const mp_rom_map_elem_t camera_module_globals_table[] = {
     {MP_ROM_QSTR(MP_QSTR_init), MP_ROM_PTR(&camera_init_obj)},
     {MP_ROM_QSTR(MP_QSTR_deinit), MP_ROM_PTR(&camera_deinit_obj)},
     {MP_ROM_QSTR(MP_QSTR_snapshot), MP_ROM_PTR(&camera_snapshot_obj)},
+    {MP_ROM_QSTR(MP_QSTR_release), MP_ROM_PTR(&camera_release_obj)},
     {MP_ROM_QSTR(MP_QSTR_jpeg), MP_ROM_PTR(&camera_jpeg_obj)},
     {MP_ROM_QSTR(MP_QSTR_flip), MP_ROM_PTR(&camera_flip_obj)},
     {MP_ROM_QSTR(MP_QSTR_mirror), MP_ROM_PTR(&camera_mirror_obj)},
