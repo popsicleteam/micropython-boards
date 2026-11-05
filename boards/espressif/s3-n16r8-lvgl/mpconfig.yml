@@ -6,8 +6,7 @@ modules:
   - aioble
   - aiohttp
   - blerepl
-  - lvgl
+  - display/ili9xxx
+  - lvgl/esp32
   - ntptime
   - utils
-drivers:
-  - display/ili9xxx

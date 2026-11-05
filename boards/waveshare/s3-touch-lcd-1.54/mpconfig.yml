@@ -6,10 +6,10 @@ modules:
   - aioble
   - aiohttp
   - blerepl
-  - lvgl
+  - display/st77xx
+  - lvgl/esp32
   - ntptime
   - utils
-drivers:
-  - display/st77xx
-  - touch/cst8xx
+devices:
   - posture/qmi8658
+  - touch/cst8xx

@@ -6,11 +6,11 @@ modules:
   - aioble
   - aiohttp
   - blerepl
-  - lvgl
+  - display/st77xx
+  - lvgl/esp32
   - ntptime
   - utils
-drivers:
-  - display/st77xx
-  - touch/cst3xx
+devices:
+  - others/pcf85063
   - posture/qmi8658
-  - device/pcf85063
+  - touch/cst3xx

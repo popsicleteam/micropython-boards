@@ -28,11 +28,9 @@ last_fps_ms = time.ticks_ms()
 
 gc.collect()
 while True:
-    frame = boarddev.camera.snapshot()
-    if frame:
-        n = min(len(frame), len(mv_buf))
-        mv_buf[:n] = memoryview(frame)[:n]
-
+    # snapshot 把 fb 数据直接 memcpy 进 mv_buf，返回 True/False；
+    # 数据已落在自己的 buffer 里，与相机 fb 生命周期解耦。
+    if boarddev.camera.snapshot(buffer=mv_buf):
         for x, y, w, h, score, category in det.detect(img):
             img.draw_rectangle(x, y, w, h, color=255, thickness=1)
             print("%.2f:%d" % (score, category))
