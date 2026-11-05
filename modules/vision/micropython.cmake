@@ -49,6 +49,7 @@ target_sources(usermod_vision INTERFACE
     ${ESP_VISION_ROOT}/modules/py_helper.c
     ${ESP_VISION_ROOT}/modules/py_espdl.cpp
     ${ESP_VISION_ROOT}/modules/py_tflite.cpp
+    ${ESP_VISION_ROOT}/platform/ev_memory.c
     ${ESP_VISION_ROOT}/platform/jpeg.c
     ${ESP_VISION_ROOT}/platform/nanotrack.cpp
     ${CMAKE_CURRENT_LIST_DIR}/vision_preview_none.c

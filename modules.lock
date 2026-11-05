@@ -1,3 +1,3 @@
 lvgl/binding        https://github.com/lvgl/lv_binding_micropython.git    032dda4b7e8419702a4b9c4c8748a4d85d51be61
-vision/esp_vision   https://github.com/espressif/esp-vision.git           83f7a7d30664383c1e9d9fe75b9e5a9747f035af
+vision/esp_vision   https://github.com/espressif/esp-vision.git           057c7224277876f14b45441d891ffd103a78db1e
 vision/ulab         https://github.com/v923z/micropython-ulab.git         2b6e0cfaa0d095e497e5a7599e0dbe3d09614ec2
