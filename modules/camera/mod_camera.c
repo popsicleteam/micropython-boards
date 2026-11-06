@@ -1,4 +1,4 @@
-#include "camera.h"
+#include "mod_camera.h"
 
 #include <string.h>
 
@@ -20,23 +20,6 @@ static const char* TAG = "CAMERA";
 /* 上一次成功 init 的配置，供 format / framesize setter 重新 init 时复用 */
 static camera_config_t s_config;
 static bool s_config_valid = false;
-
-/* 零拷贝 snapshot 暂存的 fb。
- * camera.snapshot() 返回的 memoryview 直接指向它；以下时机自动归还：
- *   - 下一次 camera.snapshot() 调用
- *   - camera.release() 调用
- *   - camera.init() / camera.deinit() 调用
- *   - camera.format() setter / camera.framesize() setter
- * 调用者必须在上述时机之前用完 memoryview，否则数据会被下一帧覆盖。
- */
-static camera_fb_t* s_pending_fb = NULL;
-
-static void pending_fb_release(void) {
-  if (s_pending_fb) {
-    esp_camera_fb_return(s_pending_fb);
-    s_pending_fb = NULL;
-  }
-}
 
 /* --------------------------------------------------------------------------
  * 共用校验：像素格式是否合法
@@ -114,9 +97,8 @@ static void sensor_settings_restore(void) {
  *   - 返回 true 表示成功；false 表示失败（已尝试回滚一次）。
  * -------------------------------------------------------------------------- */
 static bool camera_reinit(pixformat_t old_format, framesize_t old_size) {
-  /* 1. 保存 sensor 运行时设置并归还 pending fb（二者都必须在 deinit 之前） */
+  /* 1. 保存 sensor 运行时设置（必须在 deinit 之前） */
   sensor_settings_save();
-  pending_fb_release();
 
   /* 2. 用新配置 init */
   esp_camera_deinit();
@@ -251,8 +233,7 @@ static mp_obj_t camera_init(mp_uint_t n_pos_args, const mp_obj_t* pos_args, mp_m
   config.fb_location = (camera_fb_location_t)args[ARG_FBLOC].u_int;
   config.grab_mode = CAMERA_GRAB_LATEST;
 
-  /* 归还 pending fb，再 deinit（首次 init 时 deinit 可能失败，忽略返回值） */
-  pending_fb_release();
+  /* deinit（首次 init 时 deinit 可能失败，忽略返回值） */
   esp_camera_deinit();
 
   esp_err_t err = esp_camera_init(&config);
@@ -273,9 +254,6 @@ static MP_DEFINE_CONST_FUN_OBJ_KW(camera_init_obj, 0, camera_init);
  * camera.deinit()
  * -------------------------------------------------------------------------- */
 static mp_obj_t camera_deinit() {
-  /* 必须在 esp_camera_deinit() 之前归还 pending fb */
-  pending_fb_release();
-
   esp_err_t err = esp_camera_deinit();
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "Camera deinit Failed");
@@ -290,9 +268,10 @@ static MP_DEFINE_CONST_FUN_OBJ_0(camera_deinit_obj, camera_deinit);
 /* --------------------------------------------------------------------------
  * camera.snapshot(*, swap_bytes=False, buffer=None)
  *
- *   buffer=None ：零拷贝，返回指向驱动 fb 的 memoryview（延迟归还）。
- *   buffer=<writable buffer> ：把 fb 数据拷进 buffer，立即归还 fb，
- *                              返回 True / False。
+ *   两条路径都立即归还 fb，不再有延迟归还的零拷贝 memoryview：
+ *     - buffer=None       ：新建 bytes 对象并返回（数据已独立于 fb）。
+ *     - buffer=<writable> ：把数据拷进 buffer，返回实际写入的字节数（int）。
+ *                           buffer 太小抛 ValueError。
  * -------------------------------------------------------------------------- */
 static mp_obj_t camera_snapshot(size_t n_pos_args, const mp_obj_t* pos_args, mp_map_t* kw_args) {
   enum { ARG_swap_bytes, ARG_buffer };
@@ -313,9 +292,6 @@ static mp_obj_t camera_snapshot(size_t n_pos_args, const mp_obj_t* pos_args, mp_
     mp_raise_TypeError(MP_ERROR_TEXT("buffer must be writable and support buffer protocol"));
   }
 
-  /* 两条路径都先归还上一帧，避免 fb 池耗尽 */
-  pending_fb_release();
-
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb) {
     ESP_LOGE(TAG, "Camera Capture Failed");
@@ -335,29 +311,18 @@ static mp_obj_t camera_snapshot(size_t n_pos_args, const mp_obj_t* pos_args, mp_
     }
   }
 
-  /* 收尾：拷贝路径立即归还，零拷贝路径暂存后返回 memoryview */
+  mp_obj_t result;
   if (use_buffer) {
     memcpy(bufinfo.buf, fb->buf, fb->len);
-    esp_camera_fb_return(fb);
-    return mp_const_true;
+    result = mp_obj_new_int((mp_int_t)fb->len);
+  } else {
+    result = mp_obj_new_bytes(fb->buf, fb->len);
   }
 
-  s_pending_fb = fb;
-  return mp_obj_new_memoryview('B', fb->len, fb->buf);
+  esp_camera_fb_return(fb);
+  return result;
 }
 static MP_DEFINE_CONST_FUN_OBJ_KW(camera_snapshot_obj, 0, camera_snapshot);
-
-/* --------------------------------------------------------------------------
- * camera.release()
- *
- *   显式归还上一次 snapshot() 持有的 fb；用户想尽早释放时调用。
- *   未持有 pending fb 时调用是安全的（空操作）。
- * -------------------------------------------------------------------------- */
-static mp_obj_t camera_release(void) {
-  pending_fb_release();
-  return mp_const_true;
-}
-static MP_DEFINE_CONST_FUN_OBJ_0(camera_release_obj, camera_release);
 
 /* --------------------------------------------------------------------------
  * camera.jpeg([quality])
@@ -371,9 +336,6 @@ static mp_obj_t camera_jpeg(size_t n_pos_args, const mp_obj_t* pos_args, mp_map_
   mp_arg_parse_all(n_pos_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, args);
 
   int quality_arg = args[ARG_quality].u_int;
-
-  /* 先归还 pending fb，避免和本次采集争用 buffer */
-  pending_fb_release();
 
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb) {
@@ -722,7 +684,6 @@ static const mp_rom_map_elem_t camera_module_globals_table[] = {
     {MP_ROM_QSTR(MP_QSTR_init), MP_ROM_PTR(&camera_init_obj)},
     {MP_ROM_QSTR(MP_QSTR_deinit), MP_ROM_PTR(&camera_deinit_obj)},
     {MP_ROM_QSTR(MP_QSTR_snapshot), MP_ROM_PTR(&camera_snapshot_obj)},
-    {MP_ROM_QSTR(MP_QSTR_release), MP_ROM_PTR(&camera_release_obj)},
     {MP_ROM_QSTR(MP_QSTR_jpeg), MP_ROM_PTR(&camera_jpeg_obj)},
     {MP_ROM_QSTR(MP_QSTR_flip), MP_ROM_PTR(&camera_flip_obj)},
     {MP_ROM_QSTR(MP_QSTR_mirror), MP_ROM_PTR(&camera_mirror_obj)},

@@ -1,4 +1,4 @@
-#include "bleuart.h"
+#include "mod_bleuart.h"
 
 #include "extmod/modbluetooth.h"
 #include "py/mperrno.h"
