@@ -52,13 +52,15 @@ target_sources(usermod_vision INTERFACE
     ${ESP_VISION_ROOT}/platform/ev_memory.c
     ${ESP_VISION_ROOT}/platform/jpeg.c
     ${ESP_VISION_ROOT}/platform/nanotrack.cpp
-    ${CMAKE_CURRENT_LIST_DIR}/vision_preview_none.c
+    ${CMAKE_CURRENT_LIST_DIR}/extmod/mod_jpeg.c
+    ${CMAKE_CURRENT_LIST_DIR}/extmod/vision_preview_none.c
 )
 target_include_directories(usermod_vision INTERFACE
     ${ESP_VISION_ROOT}/modules
     ${ESP_VISION_ROOT}/platform
     ${IMLIB_LIB_DIR}/upstream
     ${IMLIB_LIB_DIR}/include
+    ${CMAKE_CURRENT_LIST_DIR}/extmod
     ${CMAKE_CURRENT_LIST_DIR}
     ${CMAKE_BINARY_DIR}
 )
