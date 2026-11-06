@@ -21,13 +21,14 @@ except ImportError:
 _devices = {}
 
 # 注册 LVGL 屏幕和触摸输入
-if lv_display_register is not None:
+lvgl_display = getattr(board_config, "lvgl_display", True)
+if lv_display_register is not None and lvgl_display:
     _devices["display"] = lv_display_register(
         getattr(board_config, "display", None),
         getattr(board_config, "display_doublebuffer", True),
         getattr(board_config, "display_factor", 4),
     )
-if lv_touch_register is not None:
+if lv_touch_register is not None and lvgl_display:
     _devices["touch"] = lv_touch_register(
         getattr(board_config, "touch", None),
         getattr(board_config, "touch_max_point", None),
