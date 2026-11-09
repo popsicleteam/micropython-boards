@@ -47,7 +47,27 @@ def link(dest, target):
     say(f"linked {dest.relative_to(REPO)} -> {target}")
 
 
-def clone_at(url, ref, dest, recursive=False):
+def clone_dep(name, dest):
+    url, tag = read_dep(name)
+    say(f"cloning {name} {tag}")
+    run(
+        [
+            "git",
+            "-c",
+            "advice.detachedHead=false",
+            "clone",
+            "-q",
+            "--depth",
+            "1",
+            "--branch",
+            tag,
+            url,
+            str(dest),
+        ],
+    )
+
+
+def clone_mod(url, ref, dest, recursive=False):
     say(f"cloning {url} at {ref} into {dest.relative_to(REPO)}")
     run(["git", "init", "-q", str(dest)])
     # Git for Windows defaults core.autocrlf=true: patches checked out CRLF don't apply.
@@ -120,23 +140,7 @@ def ensure_micropython(env_path):
     if env_path:
         link(MICROPY_DIR, env_path)
     else:
-        url, tag = read_dep("micropython")
-        say(f"cloning MicroPython {tag}")
-        run(
-            [
-                "git",
-                "-c",
-                "advice.detachedHead=false",
-                "clone",
-                "-q",
-                "--depth",
-                "1",
-                "--branch",
-                tag,
-                url,
-                str(MICROPY_DIR),
-            ],
-        )
+        clone_dep("micropython", MICROPY_DIR)
 
 
 def ensure_espidf(env_path):
@@ -146,23 +150,9 @@ def ensure_espidf(env_path):
     if env_path:
         link(idf_path, env_path)
     else:
-        url, tag = read_dep("esp-idf")
-        say(f"cloning ESP-IDF {tag}")
-        run(
-            [
-                "git",
-                "-c",
-                "advice.detachedHead=false",
-                "clone",
-                "-q",
-                "--depth",
-                "1",
-                "--branch",
-                tag,
-                url,
-                str(idf_path),
-            ],
-        )
+        clone_dep("esp-idf", idf_path)
+        # 安装环境
+        run(f'{idf_path / "install.sh"}')
     return idf_path
 
 
@@ -239,7 +229,7 @@ def ensure_modules(board_config):
                         mod_dir, url, ref = ext_mod
                         mod_path = MODULES_DIR / Path(mod_dir)
                         if not (mod_path.exists() or mod_path.is_symlink()):
-                            clone_at(url, ref, mod_path, False)
+                            clone_mod(url, ref, mod_path, False)
 
                 mod_path = Path(mod)
                 if (MODULES_DIR / mod_path).exists():  # ex. lvgl
@@ -453,7 +443,7 @@ def build(args):
         # 特定配置
         if port == "esp32":
             idf_path = ensure_espidf(os.environ.get("ESPIDF_DIR"))
-            prefix = f'. "{(idf_path / "export.sh")}" >/dev/null && '
+            prefix = f'. "{idf_path / "export.sh"}" >/dev/null && '
             ensure_idf_deps(board_config)
             ensure_sdkconfig(board_config)
             if (board_path / "sdkconfig.board").exists():
